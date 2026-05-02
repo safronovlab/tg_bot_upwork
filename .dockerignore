@@ -1,0 +1,46 @@
+# Python build artifacts
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+.Python
+
+# Virtualenvs
+.venv/
+venv/
+env/
+
+# Test / lint caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Tests not needed at runtime
+tests/
+
+# Secrets and runtime config (loaded via env_file at runtime, not baked in)
+.env
+.env.local
+.env.*.local
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+
+# VCS
+.git/
+.gitignore
+.gitkeep
+
+# Docs (image runtime doesn't need them)
+*.md
+
+# Compose / Docker (not needed inside image)
+compose*.yml
+docker-compose*.yml
+Dockerfile.dev
+.dockerignore

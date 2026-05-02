@@ -1,0 +1,23 @@
+services:
+  bot:
+    build: .
+    container_name: upwork_tg_bot
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # Coolify magic. При наличии этой переменной Coolify автоматически:
+      #  1) подставляет в неё FQDN из UI (Domains для сервиса bot),
+      #  2) навешивает Traefik-метки для :443 → bot:8080,
+      #  3) заказывает/обновляет Let's Encrypt сертификат.
+      # Снаружи нужен только HTTPS — порт 8080 не публикуется.
+      - SERVICE_FQDN_BOT_8080
+    expose:
+      - "8080"
+    networks:
+      - coolify
+
+networks:
+  # External сеть Coolify содержит Postgres-ресурс l6bjbfahvgll4rvvtqzxv24g.
+  # Бот видит БД по DNS-alias: l6bjbfahvgll4rvvtqzxv24g:5432.
+  coolify:
+    external: true
