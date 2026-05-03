@@ -284,6 +284,68 @@ class TestProcessIncomingJob:
         assert result == pipeline.PipelineResult.FILTERED_ANALYSIS
         stub_db["delete_job"].assert_awaited_once_with(job.upwork_job_id)
 
+    async def test_filtered_when_float_below_threshold(
+        self, job, settings, stub_db, stub_log, monkeypatch
+    ):
+        """4.8 < 5.0 — должен фильтроваться, несмотря на round(4.8)=5.
+
+        Регрессия: до фикса parse_rating округлял до int=5, и сравнение
+        5 < 5 = False пропускало вакансию в TG. Теперь сравнение по float."""
+        from src import llm
+
+        settings.analysis_threshold = 5
+        stub_db["upsert_and_get_state"].return_value = (True, "pending")
+        monkeypatch.setattr(llm, "pre_screen", AsyncMock(return_value=8), raising=False)
+        monkeypatch.setattr(
+            llm,
+            "analyze",
+            AsyncMock(return_value="x" * 60 + "\nРЕЙТИНГ: 4.8/10\n"),
+            raising=False,
+        )
+        result = await pipeline.process_incoming_job(job, settings)
+        assert result == pipeline.PipelineResult.FILTERED_ANALYSIS
+
+    async def test_passes_when_float_equals_threshold(
+        self, job, settings, stub_db, stub_log, monkeypatch
+    ):
+        """5.0 ≥ 5 — должен пройти. Граница включающая."""
+        from src import llm
+
+        settings.analysis_threshold = 5
+        stub_db["get_settings_cached"].return_value = settings
+        stub_db["upsert_and_get_state"].return_value = (True, "pending")
+        monkeypatch.setattr(llm, "pre_screen", AsyncMock(return_value=8), raising=False)
+        monkeypatch.setattr(
+            llm,
+            "analyze",
+            AsyncMock(return_value="x" * 60 + "\nРЕЙТИНГ: 5.0\n"),
+            raising=False,
+        )
+        result = await pipeline.process_incoming_job(job, settings)
+        assert result == pipeline.PipelineResult.DELIVERED
+
+    async def test_silent_uses_float_rating(
+        self, job, settings, stub_db, stub_log, stub_notifier, monkeypatch
+    ):
+        """7.6 < 8 — silent=True, несмотря на round(7.6)=8. Параллельный
+        rounding-баг для loud_notification_threshold."""
+        from src import llm
+
+        settings.analysis_threshold = 0
+        settings.loud_notification_threshold = 8
+        stub_db["get_settings_cached"].return_value = settings
+        stub_db["upsert_and_get_state"].return_value = (True, "pending")
+        monkeypatch.setattr(llm, "pre_screen", AsyncMock(return_value=8), raising=False)
+        monkeypatch.setattr(
+            llm,
+            "analyze",
+            AsyncMock(return_value="x" * 60 + "\nРЕЙТИНГ: 7.6\n"),
+            raising=False,
+        )
+        await pipeline.process_incoming_job(job, settings)
+        _, kwargs = stub_notifier.send_job.call_args
+        assert kwargs.get("silent") is True
+
     async def test_queued_paused_manual_priority(
         self, job, settings, stub_db, stub_log, monkeypatch
     ):

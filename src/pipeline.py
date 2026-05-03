@@ -45,15 +45,25 @@ HOURLY_BUDGET_RE = re.compile(r"\$?(\d+(?:\.\d+)?)(?:\s*-\s*\$?(\d+(?:\.\d+)?))?
 FIXED_BUDGET_RE = re.compile(r"\$?(\d+(?:[\.,]\d+)?)")
 
 
-def parse_rating(text: str) -> int:
-    """Парсит РЕЙТИНГ: N из ai_analysis, clamped to 0..10."""
+def parse_rating_float(text: str) -> float:
+    """Парсит РЕЙТИНГ: N из ai_analysis как float [0.0..10.0].
+
+    Используется для сравнения с порогами analysis_threshold /
+    loud_notification_threshold — иначе округление до int делает порог
+    нестрогим (4.8 → 5 → проходит порог=5 несмотря на «реальные» < 5).
+    """
     if not text:
-        return 0
+        return 0.0
     m = RATING_RE.search(text)
     if not m:
-        return 0
+        return 0.0
     val = float(m.group(1).replace(",", "."))
-    return max(0, min(10, round(val)))
+    return max(0.0, min(10.0, val))
+
+
+def parse_rating(text: str) -> int:
+    """Округлённый int [0..10] — для записи в smallint колонку upwork_jobs.rating."""
+    return round(parse_rating_float(text))
 
 
 def parse_pre_rating(text: str) -> int | None:
@@ -245,22 +255,26 @@ async def _stage_pre_screen(job: Job, settings: BotSettings) -> PipelineResult |
     return None
 
 
-async def _stage_analyze(job: Job, settings: BotSettings) -> tuple[str, int] | PipelineResult:
-    """Returns (analysis, rating) на успехе или PipelineResult — конечный."""
+async def _stage_analyze(job: Job, settings: BotSettings) -> tuple[str, float] | PipelineResult:
+    """Returns (analysis, rating_float) на успехе или PipelineResult — конечный.
+
+    Возвращаем float (а не int) чтобы dispatch смог точно сравнить
+    с loud_notification_threshold без ошибок округления.
+    """
     analysis = await llm.analyze(None, job)
     if not analysis or len(analysis) < 50:
         await db.bump_attempts(job.upwork_job_id, "analysis_short_or_empty")
         return PipelineResult.LLM_FAILED
-    rating = parse_rating(analysis)
-    if rating < settings.analysis_threshold:
-        await _emit_finished(job, "filtered_analysis", rating=rating)
+    rating_float = parse_rating_float(analysis)
+    if rating_float < settings.analysis_threshold:
+        await _emit_finished(job, "filtered_analysis", rating=round(rating_float))
         await db.delete_job(job.upwork_job_id)
         return PipelineResult.FILTERED_ANALYSIS
-    return analysis, rating
+    return analysis, rating_float
 
 
 async def _stage_dispatch(
-    job: Job, settings: BotSettings, analysis: str, rating: int
+    job: Job, settings: BotSettings, analysis: str, rating_float: float
 ) -> PipelineResult:
     """Pause-aware финальный шаг: очередь или send→mark_sent.
 
@@ -269,8 +283,12 @@ async def _stage_dispatch(
     (5-15 с) — пользователь мог войти в подменю (is_paused_menu=True) или
     нажать «Остановить» (is_paused=True). Без re-read эти изменения
     игнорируются и вакансия прорывается в TG. См. BOT.md §2 + §10.
+
+    Принимаем `rating_float` для точного сравнения с loud_threshold;
+    в БД (smallint колонка) кладём округлённое.
     """
     fresh = await db.get_settings_cached()
+    rating = round(rating_float)
 
     # Ручная пауза имеет приоритет (PIPELINE.md §4)
     if fresh.is_paused:
@@ -284,7 +302,7 @@ async def _stage_dispatch(
         return PipelineResult.QUEUED_PAUSED
 
     await db.set_analysis_and_state(job.upwork_job_id, analysis, rating, "delivered")
-    silent = rating < fresh.loud_notification_threshold
+    silent = rating_float < fresh.loud_notification_threshold
     await notifier.send_job(job, analysis, silent=silent)
     await db.mark_sent(job.upwork_job_id)
     await _emit_finished(job, "delivered", rating=rating, silent=silent)
@@ -308,9 +326,9 @@ async def process_incoming_job(job: Job, settings: BotSettings) -> PipelineResul
     analyzed = await _stage_analyze(job, settings)
     if isinstance(analyzed, PipelineResult):
         return analyzed
-    analysis, rating = analyzed
+    analysis, rating_float = analyzed
 
-    return await _stage_dispatch(job, settings, analysis, rating)
+    return await _stage_dispatch(job, settings, analysis, rating_float)
 
 
 # --------------------------------------------------------------------------- #
