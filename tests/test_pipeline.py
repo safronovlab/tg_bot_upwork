@@ -292,6 +292,8 @@ class TestProcessIncomingJob:
 
         settings.is_paused = True
         settings.is_paused_menu = True
+        # dispatch перечитывает settings — стаб возвращает тот же объект
+        stub_db["get_settings_cached"].return_value = settings
         stub_db["upsert_and_get_state"].return_value = (True, "pending")
         monkeypatch.setattr(llm, "pre_screen", AsyncMock(return_value=8), raising=False)
         monkeypatch.setattr(
@@ -310,6 +312,7 @@ class TestProcessIncomingJob:
 
         settings.is_paused = False
         settings.is_paused_menu = True
+        stub_db["get_settings_cached"].return_value = settings
         stub_db["upsert_and_get_state"].return_value = (True, "pending")
         monkeypatch.setattr(llm, "pre_screen", AsyncMock(return_value=8), raising=False)
         monkeypatch.setattr(
@@ -320,6 +323,34 @@ class TestProcessIncomingJob:
         )
         result = await pipeline.process_incoming_job(job, settings)
         assert result == pipeline.PipelineResult.QUEUED_PAUSED
+
+    async def test_dispatch_rereads_settings_after_analysis(
+        self, job, settings, stub_db, stub_log, monkeypatch
+    ):
+        """Race-fix: snapshot.is_paused_menu=False, но к финалу dispatch'а в БД
+        флаг уже True (юзер зашёл в подменю пока крутился LLM). Ожидаем
+        queued_menu, не delivered. Проверяет fix для bug когда уведомления
+        прорывались в TG несмотря на is_paused_menu=True (см. BOT.md §10)."""
+        from src import llm
+
+        # snapshot — сделан до того как пользователь вошёл в меню
+        settings.is_paused = False
+        settings.is_paused_menu = False
+        # к моменту dispatch'а юзер уже в подменю
+        fresh = type(settings)(is_paused=False, is_paused_menu=True)
+        stub_db["get_settings_cached"].return_value = fresh
+        stub_db["upsert_and_get_state"].return_value = (True, "pending")
+        monkeypatch.setattr(llm, "pre_screen", AsyncMock(return_value=8), raising=False)
+        monkeypatch.setattr(
+            llm,
+            "analyze",
+            AsyncMock(return_value="x" * 60 + "\nРЕЙТИНГ: 9\n"),
+            raising=False,
+        )
+        result = await pipeline.process_incoming_job(job, settings)
+        assert result == pipeline.PipelineResult.QUEUED_PAUSED
+        args, _ = stub_db["set_analysis_state_queued"].call_args
+        assert args[-1] == "menu"
 
     async def test_delivered_silent_below_loud_threshold(
         self, job, settings, stub_db, stub_log, stub_notifier, monkeypatch

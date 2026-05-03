@@ -262,20 +262,29 @@ async def _stage_analyze(job: Job, settings: BotSettings) -> tuple[str, int] | P
 async def _stage_dispatch(
     job: Job, settings: BotSettings, analysis: str, rating: int
 ) -> PipelineResult:
-    """Pause-aware финальный шаг: очередь или send→mark_sent."""
+    """Pause-aware финальный шаг: очередь или send→mark_sent.
+
+    Перечитываем `settings` ИЗ БД (через cached-getter с актуальным TTL):
+    между snapshot'ом из `process_incoming_job` и сейчас прошёл LLM-analysis
+    (5-15 с) — пользователь мог войти в подменю (is_paused_menu=True) или
+    нажать «Остановить» (is_paused=True). Без re-read эти изменения
+    игнорируются и вакансия прорывается в TG. См. BOT.md §2 + §10.
+    """
+    fresh = await db.get_settings_cached()
+
     # Ручная пауза имеет приоритет (PIPELINE.md §4)
-    if settings.is_paused:
+    if fresh.is_paused:
         await db.set_analysis_state_queued(job.upwork_job_id, analysis, rating, "manual")
         await _emit_finished(job, "queued_manual", rating=rating)
         return PipelineResult.QUEUED_PAUSED
 
-    if settings.is_paused_menu:
+    if fresh.is_paused_menu:
         await db.set_analysis_state_queued(job.upwork_job_id, analysis, rating, "menu")
         await _emit_finished(job, "queued_menu", rating=rating)
         return PipelineResult.QUEUED_PAUSED
 
     await db.set_analysis_and_state(job.upwork_job_id, analysis, rating, "delivered")
-    silent = rating < settings.loud_notification_threshold
+    silent = rating < fresh.loud_notification_threshold
     await notifier.send_job(job, analysis, silent=silent)
     await db.mark_sent(job.upwork_job_id)
     await _emit_finished(job, "delivered", rating=rating, silent=silent)
