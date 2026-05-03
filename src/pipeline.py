@@ -220,9 +220,21 @@ async def _emit_finished(job: Job, result: str, **ctx: Any) -> None:
 
 
 async def _stage_save_and_emit_received(job: Job) -> PipelineResult | None:
-    """Save first, then process — упсёрт ДО любого LLM (PIPELINE.md §7.1.2)."""
-    inserted, current_state = await db.upsert_and_get_state(job)
-    if not inserted and current_state in TERMINAL_STATES:
+    """Save first, then process — упсёрт ДО любого LLM (PIPELINE.md §7.1.2).
+
+    Любая существующая запись (inserted=False) трактуется как dup и пропускается.
+    Раньше skip срабатывал только для terminal-состояний, и параллельные
+    pipeline-таски на один upwork_job_id (когда Vollna шлёт ту же вакансию
+    в нескольких batch'ах подряд) видели current_state ∈ {pending, pre_screened}
+    и продолжали независимо — приводя к N одинаковым уведомлениям в TG
+    с разными LLM-вердиктами. UNIQUE по upwork_job_id защищает БД, но не TG.
+
+    Trade-off: если бот упал между upsert и доставкой — вакансия зависнет в
+    non-terminal state и при следующем приёме того же payload будет skip'нута.
+    Для текущей нагрузки (single-user, редкие крэши) приемлемо.
+    """
+    inserted, _ = await db.upsert_and_get_state(job)
+    if not inserted:
         return PipelineResult.SKIPPED_DUPLICATE
     await log.emit(
         "job_received",

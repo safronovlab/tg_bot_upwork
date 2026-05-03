@@ -220,6 +220,21 @@ class TestProcessIncomingJob:
         result = await pipeline.process_incoming_job(job, settings)
         assert result == pipeline.PipelineResult.SKIPPED_DUPLICATE
 
+    async def test_skipped_duplicate_non_terminal_state(self, job, settings, stub_db, stub_log):
+        """Регрессия: параллельная Vollna-batch на тот же upwork_job_id видела
+        current_state=pending и продолжала pipeline → 3 одинаковых уведомления.
+        Теперь любая существующая запись (inserted=False) skip'ается."""
+        stub_db["upsert_and_get_state"].return_value = (False, "pending")
+        result = await pipeline.process_incoming_job(job, settings)
+        assert result == pipeline.PipelineResult.SKIPPED_DUPLICATE
+
+    async def test_skipped_duplicate_pre_screened_state(self, job, settings, stub_db, stub_log):
+        """Та же регрессия для уже прошедшего pre_screen — параллельная таска
+        не должна делать второй analysis."""
+        stub_db["upsert_and_get_state"].return_value = (False, "pre_screened")
+        result = await pipeline.process_incoming_job(job, settings)
+        assert result == pipeline.PipelineResult.SKIPPED_DUPLICATE
+
     async def test_filtered_hard_deletes(self, job, settings, stub_db, stub_log):
         settings.hard_min_client_spent = 1_000_000
         job.client_total_spent = 0
