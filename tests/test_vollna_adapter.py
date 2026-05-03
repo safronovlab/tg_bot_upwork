@@ -130,6 +130,24 @@ class TestVollnaToInternal:
         assert proj.client_rating is None
         assert proj.client_registered_at is None
 
+    def test_questions_list_joined_to_text(self):
+        p = _sample_project(questions=["Q1?", "Q2?", "Q3?"])
+        raw = json.dumps(_sample_payload(p)).encode()
+        body = msgspec.json.decode(vollna_to_internal_bytes(raw), type=WebhookBody)
+        assert body.body.projects[0].questions == "Q1?\n\nQ2?\n\nQ3?"
+
+    def test_questions_none_stays_none(self):
+        p = _sample_project(questions=None)
+        raw = json.dumps(_sample_payload(p)).encode()
+        body = msgspec.json.decode(vollna_to_internal_bytes(raw), type=WebhookBody)
+        assert body.body.projects[0].questions is None
+
+    def test_questions_string_passthrough(self):
+        p = _sample_project(questions="single string")
+        raw = json.dumps(_sample_payload(p)).encode()
+        body = msgspec.json.decode(vollna_to_internal_bytes(raw), type=WebhookBody)
+        assert body.body.projects[0].questions == "single string"
+
     def test_country_field_can_be_none(self):
         p = _sample_project()
         p["client_details"]["country"] = None

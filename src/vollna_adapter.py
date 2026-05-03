@@ -56,6 +56,17 @@ def _stringify(value: Any) -> str | None:
     return str(value)
 
 
+def _questions_to_text(value: Any) -> str | None:
+    """Vollna `questions` бывает None, str, или list[str] (массив вопросов клиента).
+    Наша схема требует `str | None` — list склеиваем в текст с разделителем.
+    """
+    if value is None:
+        return None
+    if isinstance(value, list):
+        return "\n\n".join(str(x) for x in value if x) or None
+    return str(value)
+
+
 def _map_project(p: dict[str, Any]) -> dict[str, Any]:
     """Один Vollna-project → словарь полей WebhookProject."""
     upwork_url, job_id = _extract_upwork_url_and_id(p.get("url", ""))
@@ -70,7 +81,7 @@ def _map_project(p: dict[str, Any]) -> dict[str, Any]:
         "job_description": p.get("description"),
         "upwork_url": upwork_url,
         "published_date": p.get("published"),
-        "questions": p.get("questions"),
+        "questions": _questions_to_text(p.get("questions")),
         "job_type": p.get("job_type"),
         "budget_type": p.get("budget_type"),
         "budget": p.get("budget"),
