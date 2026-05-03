@@ -1,4 +1,7 @@
-"""aiohttp.web routes: POST /upwork-lead + GET /health. См. PIPELINE.md §2 + ARCHITECTURE.md §5.3."""
+"""aiohttp.web routes: POST /upwork-lead + POST /upwork-lead/vollna + GET /health.
+
+См. PIPELINE.md §2 + ARCHITECTURE.md §5.3.
+"""
 
 from __future__ import annotations
 
@@ -6,6 +9,7 @@ import asyncio
 import hashlib
 import hmac
 import logging
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 import msgspec
@@ -14,6 +18,7 @@ from aiohttp import web
 from src import config, db, log
 from src.models import WebhookBody
 from src.pipeline import _process_batch_async
+from src.vollna_adapter import VollnaAdapterError, vollna_to_internal_bytes
 
 if TYPE_CHECKING:
     from aiogram import Bot, Dispatcher
@@ -24,6 +29,11 @@ _tasks: set[asyncio.Task] = set()
 
 # Флаг graceful shutdown — webhook отвечает 503 (ARCHITECTURE.md §5.3).
 _shutting_down = False
+
+# Сигнатура трансформации сырых bytes в наш WebhookBody-совместимый JSON.
+# Возвращает bytes (а не WebhookBody напрямую), чтобы общий msgspec-парсинг и
+# обработка ValidationError жили в одном месте.
+BytesNormalizer = Callable[[bytes], bytes]
 
 
 def set_shutting_down(value: bool) -> None:
@@ -52,7 +62,12 @@ def _check_bearer(request: web.Request) -> bool:
     return hmac.compare_digest(raw[7:], expected)
 
 
-async def upwork_lead(request: web.Request) -> web.Response:
+async def _handle_lead(request: web.Request, normalize: BytesNormalizer) -> web.Response:
+    """Общий webhook flow: auth → idempotency → нормализация → парсинг → pipeline.
+
+    `normalize` принимает сырое тело и возвращает bytes в формате нашего
+    `WebhookBody`. Для нативного формата это identity, для Vollna — адаптер.
+    """
     if _is_shutting_down():
         return web.json_response({"status": "shutting_down"}, status=503)
 
@@ -78,8 +93,9 @@ async def upwork_lead(request: web.Request) -> web.Response:
 
     # Парсим payload только для нового запроса
     try:
-        payload = msgspec.json.decode(body_bytes, type=WebhookBody)
-    except (msgspec.ValidationError, msgspec.DecodeError) as e:
+        normalized = normalize(body_bytes)
+        payload = msgspec.json.decode(normalized, type=WebhookBody)
+    except (msgspec.ValidationError, msgspec.DecodeError, VollnaAdapterError) as e:
         await db.save_normalize_failure(request_id, body_bytes, str(e))
         await log.emit(
             "normalize_failed",
@@ -93,6 +109,20 @@ async def upwork_lead(request: web.Request) -> web.Response:
     _tasks.add(task)
     task.add_done_callback(_tasks.discard)
     return web.json_response({"status": "accepted"})
+
+
+def _identity(body_bytes: bytes) -> bytes:
+    return body_bytes
+
+
+async def upwork_lead(request: web.Request) -> web.Response:
+    """Нативный формат: `{"body": {"projects": [...]}}`."""
+    return await _handle_lead(request, _identity)
+
+
+async def upwork_lead_vollna(request: web.Request) -> web.Response:
+    """Формат vollna.com — адаптируем в наш и дальше общим путём."""
+    return await _handle_lead(request, vollna_to_internal_bytes)
 
 
 async def health(request: web.Request) -> web.Response:
@@ -121,6 +151,7 @@ async def start(bot: Bot, dp: Dispatcher, port: int = 8080) -> web.AppRunner:
     del bot, dp  # пока не используются — см. ARCHITECTURE.md §5.2
     app = web.Application()
     app.router.add_post("/upwork-lead", upwork_lead)
+    app.router.add_post("/upwork-lead/vollna", upwork_lead_vollna)
     app.router.add_get("/health", health)
     runner = web.AppRunner(app)
     await runner.setup()
