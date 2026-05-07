@@ -28,6 +28,11 @@ LLM_CONCURRENCY: int = int(os.environ.get("LLM_CONCURRENCY", "5"))
 PIPELINE_BACKGROUND_TIMEOUT: int = int(os.environ.get("PIPELINE_BACKGROUND_TIMEOUT", "120"))
 LOG_LEVEL: str = os.environ.get("LOG_LEVEL", "INFO")
 
+# Минимальный рейтинг для попадания в manual-очередь (Отчёт) при is_paused=True.
+# Днём бот живой → analysis_threshold (по умолчанию 5). Ночью при остановке
+# копятся только «крупные рыбы» >= PAUSED_MIN_RATING. Жёстче чем порог анализа.
+PAUSED_MIN_RATING: float = float(os.environ.get("PAUSED_MIN_RATING", "7"))
+
 # Authorization header `Bearer <token>` для POST /upwork-lead. Пустая строка =
 # проверка отключена (dev / тесты). В prod ОБЯЗАТЕЛЬНО задать.
 WEBHOOK_BEARER_TOKEN: str = os.environ.get("WEBHOOK_BEARER_TOKEN", "")

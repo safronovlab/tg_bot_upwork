@@ -44,6 +44,7 @@
                                               │   • если rating < threshold → DELETE → FILTERED_ANALYSIS
                                               │
                                               ├── проверка пауз
+                                              │   • is_paused + rating < PAUSED_MIN_RATING → DELETE → FILTERED_ANALYSIS
                                               │   • is_paused → state='analyzed', queued_reason='manual' → QUEUED_PAUSED
                                               │   • is_paused_menu → state='analyzed', queued_reason='menu' → QUEUED_PAUSED
                                               │
@@ -228,7 +229,15 @@ async def process_incoming_job(job, settings: BotSettings) -> PipelineResult:
 
     # Любая из двух пауз → копим в очередь.
     # Ручная пауза имеет приоритет (даже если оператор открыл меню под паузой).
+    # При is_paused применяется доп. порог config.PAUSED_MIN_RATING (по умолч. 7) —
+    # ночью копим только «крупные рыбы», мелочь отбрасываем.
     if settings.is_paused:
+        if rating_float < config.PAUSED_MIN_RATING:
+            await log.emit("pipeline_finished",
+                           upwork_job_id=job.upwork_job_id, result="filtered_paused",
+                           rating=rating, threshold=config.PAUSED_MIN_RATING)
+            await db.delete_job(job.upwork_job_id)
+            return PipelineResult.FILTERED_ANALYSIS
         await db.set_analysis_state_queued(job.upwork_job_id, analysis, rating, "manual")
         await log.emit("pipeline_finished",
                        upwork_job_id=job.upwork_job_id, result="queued_manual",

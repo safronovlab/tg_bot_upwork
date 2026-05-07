@@ -302,8 +302,20 @@ async def _stage_dispatch(
     fresh = await db.get_settings_cached()
     rating = round(rating_float)
 
-    # Ручная пауза имеет приоритет (PIPELINE.md §4)
+    # Ручная пауза имеет приоритет (PIPELINE.md §4).
+    # Доп. фильтр: ночью копим в Отчёт только rating >= PAUSED_MIN_RATING,
+    # «мелочь» < порога просто отбрасываем (день: analysis_threshold ~5,
+    # ночь: PAUSED_MIN_RATING ~7).
     if fresh.is_paused:
+        if rating_float < config.PAUSED_MIN_RATING:
+            await _emit_finished(
+                job,
+                "filtered_paused",
+                rating=rating,
+                threshold=config.PAUSED_MIN_RATING,
+            )
+            await db.delete_job(job.upwork_job_id)
+            return PipelineResult.FILTERED_ANALYSIS
         await db.set_analysis_state_queued(job.upwork_job_id, analysis, rating, "manual")
         await _emit_finished(job, "queued_manual", rating=rating)
         return PipelineResult.QUEUED_PAUSED
