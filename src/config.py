@@ -53,6 +53,24 @@ OPENROUTER_HTTP_REFERER: str = os.environ.get("OPENROUTER_HTTP_REFERER", "")
 OPENROUTER_X_TITLE: str = os.environ.get("OPENROUTER_X_TITLE", "Upwork AI Pipeline")
 
 
+# --------------------------------------------------------------------------- #
+# Chat-подсистема (src/chat/CHAT.md §4 Configuration).
+# IMAP/SMTP credentials живут в `secrets` таблице (приоритет: БД → env).
+# Эти env-значения — только bootstrap при первом старте (если секрет в БД пуст).
+# Меняются после первого ввода через Telegram UI (Настройки → Email подключение).
+# --------------------------------------------------------------------------- #
+IMAP_HOST: str = os.environ.get("IMAP_HOST", "imap.mail.me.com")
+IMAP_PORT: int = int(os.environ.get("IMAP_PORT", "993"))
+IMAP_USER: str = os.environ.get("IMAP_USER", "")
+IMAP_PASSWORD: str = os.environ.get("IMAP_PASSWORD", "")
+IMAP_FOLDER: str = os.environ.get("IMAP_FOLDER", "INBOX")
+
+SMTP_HOST: str = os.environ.get("SMTP_HOST", "smtp.mail.me.com")
+SMTP_PORT: int = int(os.environ.get("SMTP_PORT", "587"))
+SMTP_USER: str = os.environ.get("SMTP_USER", "")
+SMTP_PASSWORD: str = os.environ.get("SMTP_PASSWORD", "")
+
+
 @dataclass(slots=True, frozen=True)
 class Settings:
     """Снимок env-конфигурации в одном объекте (ARCHITECTURE.md §4)."""

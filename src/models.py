@@ -85,3 +85,10 @@ class BotSettings:
     analysis_fallback_model: str = "minimax/minimax-m2.5"
 
     loud_notification_threshold: int = 8
+
+    # Chat-подсистема (CHAT.md §3 Settings).
+    # Default false — Phase 1 даёт только notification, AI-ответ выключен пока
+    # оператор не убедится что IMAP/SMTP стабильны. Включается через TG.
+    chat_ai_night_enabled: bool = False
+    chat_ai_delay_min_seconds: int = 60
+    chat_ai_delay_max_seconds: int = 120

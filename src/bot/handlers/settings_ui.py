@@ -31,6 +31,7 @@ PROMPT_LABEL_TO_SLOT: dict[str, str] = {
     "Промпт: Pre-Screen": "pre_screen",
     "Промпт: Анализ": "analysis",
     "Промпт: Cover": "cover",
+    "Промпт: AI ответ": "dialog_night",
 }
 
 MODEL_LABEL_TO_ROLE: dict[str, str] = {
@@ -334,6 +335,38 @@ async def start_threshold_edit(message: Message, state: FSMContext, field: str) 
     )
 
 
+async def show_chat_ai_toggle_card(
+    message: Message, state: FSMContext | None = None
+) -> None:
+    """BOT.md §3.6 + CHAT.md §6 — toggle AI ответа при остановке (is_paused=true).
+
+    `field=chat_ai_night_enabled` — маркер для handle_back и для
+    `handle_no_hires_toggle` который шарит ту же реализацию toggle.
+    """
+    current = bool(await db.get_setting("chat_ai_night_enabled"))
+    state_label = "ВКЛЮЧЕНО" if current else "ВЫКЛЮЧЕНО"
+    history = await _render_history("threshold_updated", "chat_ai_night_enabled")
+    text = (
+        "AI ответ при остановке (Чат)\n\n"
+        f"Текущее значение: {state_label}\n"
+        "Поле в БД: chat_ai_night_enabled\n\n"
+        "Что это: когда бот «Остановлен» (is_paused=true) и эта опция ВКЛ —\n"
+        "AI автоматически отвечает клиентам по промту `dialog_night` с задержкой\n"
+        "1-2 минуты. Если ВЫКЛ — сообщения копятся и показываются в Отчёте,\n"
+        "ответы не отправляются.\n"
+        f"{history}"
+    )
+    if state is not None:
+        await state.update_data(
+            field="chat_ai_night_enabled",
+            slot=None,
+            role=None,
+            email_field=None,
+            section="settings",
+        )
+    await message.answer(text, reply_markup=keyboards.toggle_action_kb(bool(current)))
+
+
 async def show_no_hires_toggle_card(message: Message, state: FSMContext | None = None) -> None:
     """BOT.md §3.6 — булев toggle карточка. `field=hard_reject_no_hires` — маркер для Назад."""
     current = await db.get_setting("hard_reject_no_hires")
@@ -353,23 +386,57 @@ async def show_no_hires_toggle_card(message: Message, state: FSMContext | None =
     await message.answer(text, reply_markup=keyboards.toggle_action_kb(bool(current)))
 
 
-async def handle_no_hires_toggle(message: Message) -> None:
-    """Нажатие [Включить] или [Выключить] — переключить и обновить карточку."""
-    current = bool(await db.get_setting("hard_reject_no_hires"))
+_BOOL_TOGGLE_REFRESH: dict[str, Any] = {}  # field → callable(message, state) — заполняется ниже
+
+
+async def handle_bool_toggle(message: Message, state: FSMContext) -> None:
+    """Generic [Включить]/[Выключить] для всех boolean-карточек.
+
+    Маркер какое поле тогглить — `state.data.field`. Поддерживаются:
+        - hard_reject_no_hires
+        - chat_ai_night_enabled
+
+    Match диспатчер `_BOOL_TOGGLE_REFRESH` решает какую карточку перерисовать
+    после flip'а (чтобы видно было обновлённое состояние).
+    """
+    data = await state.get_data()
+    field = data.get("field")
+    if field not in {"hard_reject_no_hires", "chat_ai_night_enabled"}:
+        # Не toggle-card → игнорируем (сюда могут попасть случайно если FSM
+        # сломался; молча возвращаемся, не показываем ошибку)
+        return
+
+    current = bool(await db.get_setting(field))
     new_value = not current
-    await db.set_setting("hard_reject_no_hires", new_value)
+    await db.set_setting(field, new_value)
     await db.invalidate_settings_cache()
     user_id = getattr(getattr(message, "from_user", None), "id", None)
     await log.emit(
         "threshold_updated",
-        field="hard_reject_no_hires",
+        field=field,
         old_value="ВКЛ" if current else "ВЫКЛ",
         new_value="ВКЛ" if new_value else "ВЫКЛ",
         via="manual",
         updated_by=user_id,
     )
     await message.answer("Сохранено.")
-    await show_no_hires_toggle_card(message)
+    refresh = _BOOL_TOGGLE_REFRESH.get(field)
+    if refresh is not None:
+        await refresh(message, state)
+
+
+# Обратная совместимость: старое имя для router'а
+handle_no_hires_toggle = handle_bool_toggle
+
+
+def _register_bool_toggle_refresh() -> None:
+    """Привязка field → функция-перерисовщик карточки. Вызывается на module-load."""
+    _BOOL_TOGGLE_REFRESH["hard_reject_no_hires"] = (
+        lambda msg, _state: show_no_hires_toggle_card(msg)
+    )
+    _BOOL_TOGGLE_REFRESH["chat_ai_night_enabled"] = (
+        lambda msg, _state: show_chat_ai_toggle_card(msg)
+    )
 
 
 async def show_apikey_card(message: Message, state: FSMContext | None = None) -> None:
@@ -406,8 +473,25 @@ async def start_apikey_edit(message: Message, state: FSMContext) -> None:
 # --------------------------------------------------------------------------- #
 # Универсальный buffer-handler (BOT.md §4) — ловит текст в любом FSM-состоянии
 # --------------------------------------------------------------------------- #
-def _redact_for_preview(value: str, current_state: str | None) -> str:
+# Email-поля которые считаются паролями — маскируются в preview + сообщения
+# удаляются после Save (CHAT.md §4 Configuration).
+_EMAIL_PASSWORD_FIELDS: frozenset[str] = frozenset({"imap_password", "smtp_password"})
+
+
+def _is_password_input(current_state: str | None, email_field: str | None) -> bool:
+    """True если текущий FSM-state означает ввод пароля (нужно маскировать)."""
     if current_state == ApiKeyEdit.waiting_key.state:
+        return True
+    from src.bot.states import EmailCredentialEdit
+
+    return (
+        current_state == EmailCredentialEdit.waiting_value.state
+        and email_field in _EMAIL_PASSWORD_FIELDS
+    )
+
+
+def _redact_for_preview(value: str, is_password: bool) -> str:
+    if is_password:
         if len(value) > 10:
             return f"{value[:6]}…{value[-4:]} ({len(value)} символов)"
         return "<скрыто>"
@@ -421,22 +505,25 @@ async def universal_buffer(message: Message, state: FSMContext) -> None:
 
     PromptEdit — накопительный (append).
     Остальные — замещающий (последний message перезаписывает).
+    Password-поля (API key + email passwords) маскируются в preview и id'шники
+    сообщений сохраняются для удаления при Save.
     """
     current_state = await state.get_state()
     data = await state.get_data()
     text = message.text or ""
+    is_password = _is_password_input(current_state, data.get("email_field"))
 
     if current_state == PromptEdit.waiting_text.state:
         buf = data.get("buf", "") + text
         preview = f"{len(buf)} символов"
     else:
         buf = text.strip()
-        preview = _redact_for_preview(buf, current_state)
+        preview = _redact_for_preview(buf, is_password)
 
     update: dict[str, Any] = {"buf": buf}
 
-    # Для ApiKeyEdit — копим id сообщений для удаления при Сохранить (BOT.md §5)
-    if current_state == ApiKeyEdit.waiting_key.state:
+    # Копим id сообщений для удаления при Сохранить (BOT.md §5, CHAT.md §4)
+    if is_password:
         ids = list(data.get("user_message_ids", []))
         if message.message_id is not None:
             ids.append(message.message_id)
@@ -553,32 +640,13 @@ async def show_settings_menu(message: Any) -> None:
     await message.answer("Что меняем?", reply_markup=keyboards.settings_inline_kb())
 
 
-async def handle_settings_inline_callback(
-    callback: Any, state: FSMContext
-) -> None:
-    """Inline-callback `settings:<action>` — диспатчит к старым open_*_submenu хендлерам.
+async def _dispatch_settings_action(action: str, msg: Any, state: FSMContext) -> None:
+    """Диспатч `settings:<action>` → нужный open_*_submenu / show_*_card.
 
-    Для разделов БЕЗ собственного reply-keyboard `[В настройки]` (logs, apikey,
-    cleanup) ставим breadcrumb `section="settings"` чтобы [Назад] вёл обратно в
-    Settings inline, а не в главное меню.
+    Вынесено из handle_settings_inline_callback для снижения cyclomatic complexity.
+    Lazy-imports для logs / cleanup / email / chat_ai — они сами импортируют
+    settings_ui (циркулярка иначе).
     """
-    action = (callback.data or "").removeprefix("settings:")
-    msg = callback.message
-    if msg is None or not hasattr(msg, "answer"):
-        await callback.answer()
-        return
-
-    # Удалить inline-сообщение перед переходом в подменю (UX)
-    if hasattr(msg, "delete"):
-        try:
-            await msg.delete()
-        except Exception:
-            pass
-
-    # Breadcrumb для разделов без собственного "В настройки"
-    if action in ("apikey", "logs", "cleanup"):
-        await state.update_data(section="settings", slot=None, role=None, field=None)
-
     if action == "prompts":
         await open_prompts_submenu(msg)
     elif action == "main_models":
@@ -589,6 +657,12 @@ async def handle_settings_inline_callback(
         await open_thresholds_submenu(msg)
     elif action == "apikey":
         await show_apikey_card(msg, state)
+    elif action == "email":
+        from src.bot.handlers.email_creds import show_email_menu
+
+        await show_email_menu(msg)
+    elif action == "chat_ai":
+        await show_chat_ai_toggle_card(msg, state)
     elif action == "logs":
         from src.bot.handlers import logs as logs_h
 
@@ -598,6 +672,34 @@ async def handle_settings_inline_callback(
 
         await cleanup_h.handle_clear_db_button(msg, state)
 
+
+async def handle_settings_inline_callback(
+    callback: Any, state: FSMContext
+) -> None:
+    """Inline-callback `settings:<action>` — диспатчит в подменю.
+
+    Для разделов БЕЗ собственного reply-keyboard `[В настройки]` (logs, apikey,
+    cleanup, email) ставим breadcrumb `section="settings"` чтобы [Назад] вёл
+    обратно в Settings inline, а не в главное меню.
+    """
+    action = (callback.data or "").removeprefix("settings:")
+    msg = callback.message
+    if msg is None or not hasattr(msg, "answer"):
+        await callback.answer()
+        return
+
+    # Удалить inline-сообщение перед переходом в подменю (UX)
+    if hasattr(msg, "delete"):
+        import contextlib
+
+        with contextlib.suppress(Exception):
+            await msg.delete()
+
+    # Breadcrumb для разделов без собственного "В настройки"
+    if action in {"apikey", "logs", "cleanup", "email"}:
+        await state.update_data(section="settings", slot=None, role=None, field=None)
+
+    await _dispatch_settings_action(action, msg, state)
     await callback.answer()
 
 
@@ -609,3 +711,7 @@ MODEL_NAME_RE = re.compile(r"^[a-z0-9._\-]+/[a-z0-9._\-]+(:[a-z0-9._\-]+)?$")
 
 def is_valid_model_name(name: str) -> bool:
     return bool(MODEL_NAME_RE.match(name)) and 3 <= len(name) <= 100
+
+
+# Регистрируем перерисовщики boolean toggle-карточек на module-load.
+_register_bool_toggle_refresh()

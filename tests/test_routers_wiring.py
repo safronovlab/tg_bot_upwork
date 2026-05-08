@@ -24,8 +24,9 @@ class TestRouterBuild:
 
     def test_callback_query_observers_registered(self) -> None:
         r = build_router()
-        # save_/desc_/analysis_/subana_/subtit_/del_/clrfav:/settings:/thr:/logs: — 10 prefix-callbacks
-        assert len(r.callback_query.handlers) == 10
+        # save_/desc_/analysis_/subana_/subtit_/del_/clrfav:/settings:/thr:/email:/logs:
+        # — 11 prefix-callbacks (email: добавлен в Phase 0 chat-подсистемы, CHAT.md §4)
+        assert len(r.callback_query.handlers) == 11
 
 
 class TestBotAppBuild:

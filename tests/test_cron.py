@@ -13,8 +13,10 @@ from src import cron
 
 
 class TestStartCron:
-    async def test_schedules_six_loops(self, pool, monkeypatch):
-        """6 фоновых задач: recover, compact, inbox, events, prompts, alert."""
+    async def test_schedules_seven_loops(self, pool, monkeypatch):
+        """7 фоновых задач: 6 cron-loop'ов (recover, compact, inbox, events,
+        prompts, alert) + 1 IMAP IDLE watcher (CHAT.md §5).
+        """
         scheduled: list = []
         real_create_task = asyncio.create_task
 
@@ -34,8 +36,12 @@ class TestStartCron:
             "alert_error_burst",
         ]:
             monkeypatch.setattr(cron, fn, AsyncMock(), raising=False)
+        # IMAP watcher тоже мокаем чтобы тест не пытался реально подключиться
+        from src.chat import inbox as inbox_mod
+
+        monkeypatch.setattr(inbox_mod, "run_imap_watcher", AsyncMock(), raising=False)
         cron.start_cron(pool)
-        assert len(scheduled) == 6
+        assert len(scheduled) == 7
 
 
 class TestLoop:

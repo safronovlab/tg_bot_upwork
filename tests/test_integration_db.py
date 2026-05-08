@@ -423,11 +423,17 @@ class TestEvents:
 # Prompts + history (DATABASE.md §3, §4)
 # --------------------------------------------------------------------------- #
 class TestPrompts:
-    async def test_bootstrap_inserts_three_default_slots(self, real_pool: asyncpg.Pool) -> None:
-        """init_schema bootstrap'ит 3 дефолтных промта (DATABASE.md §3)."""
+    async def test_bootstrap_inserts_default_slots(self, real_pool: asyncpg.Pool) -> None:
+        """init_schema bootstrap'ит дефолтные промты (DATABASE.md §3, CHAT.md §3.3).
+
+        Сверяем со списком DEFAULT_PROMPTS — fixture обновляется автоматически
+        при добавлении новых слотов.
+        """
+        from src import migrations
+
         rows = await real_pool.fetch("SELECT slot, content FROM ai_prompts")
         slots = {r["slot"] for r in rows}
-        assert slots == {"pre_screen", "analysis", "cover"}
+        assert slots == set(migrations.DEFAULT_PROMPTS.keys())
         for r in rows:
             assert len(r["content"]) > 0
 

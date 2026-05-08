@@ -377,8 +377,11 @@ from src import migrations
 
 class TestPromptsBootstrap:
     async def test_bootstrap_emits_event_on_inserts(self, pool, monkeypatch, stub_log):
-        # fetchval возвращает slot для каждого вызова → "вставлено"
-        pool.fetchval = AsyncMock(side_effect=["pre_screen", "analysis", "cover"])
+        # fetchval возвращает slot для каждого вызова → "вставлено".
+        # Длина side_effect = len(DEFAULT_PROMPTS) — fixture обновляется при добавлении слотов.
+        pool.fetchval = AsyncMock(
+            side_effect=list(migrations.DEFAULT_PROMPTS.keys())
+        )
         await migrations._bootstrap_prompts(pool)
         events = [c.args[0] for c in stub_log.call_args_list if c.args]
         assert "prompts_bootstrap_done" in events
@@ -1607,17 +1610,17 @@ class TestSettingsUiApiKeyCardWithState:
 
 
 class TestRedactPreview:
-    def test_short_apikey_hidden(self):
+    def test_short_password_hidden(self):
+        """Сигнатура: (value, is_password). Короткий пароль → <скрыто>."""
         from src.bot.handlers.settings_ui import _redact_for_preview
-        from src.bot.states import ApiKeyEdit
 
-        out = _redact_for_preview("abc", ApiKeyEdit.waiting_key.state)
+        out = _redact_for_preview("abc", is_password=True)
         assert "<скрыто>" in out
 
     def test_long_text_truncated(self):
         from src.bot.handlers.settings_ui import _redact_for_preview
 
-        out = _redact_for_preview("x" * 100, current_state=None)
+        out = _redact_for_preview("x" * 100, is_password=False)
         assert len(out) < 100
         assert out.endswith("…")
 

@@ -277,3 +277,169 @@ async def send_favorite_card(row: dict) -> None:
         reply_markup=kb_sub_title_view(upwork_job_id, url),
         silent=True,
     )
+
+
+# --------------------------------------------------------------------------- #
+# Chat-подсистема — карточки входящих/Q+A. См. CHAT.md §7.
+# --------------------------------------------------------------------------- #
+_DEFAULT_UPWORK_MESSAGES_URL = "https://www.upwork.com/messages/"
+
+
+def _chat_card_kb(job_url: str | None) -> InlineKeyboardMarkup:
+    """Inline-кнопка `🔗 Открыть чат в Upwork` под chat-карточкой."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Открыть чат в Upwork",
+                    url=job_url or _DEFAULT_UPWORK_MESSAGES_URL,
+                )
+            ]
+        ]
+    )
+
+
+def _truncate(text: str, limit: int) -> str:
+    """Обрезать text до limit chars с многоточием."""
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1].rstrip() + "…"
+
+
+def format_inbound_card(
+    *,
+    client_name: str,
+    job_title: str | None,
+    body_text: str,
+    received_at: str | None = None,
+) -> str:
+    """Карточка входящего сообщения: 💼/👤/🕐 заголовок + body. CHAT.md §7.4.
+
+    HTML-escape всего пользовательского контента.
+    """
+    parts: list[str] = []
+    if job_title:
+        parts.append(f"💼 <b>{html.escape(_truncate(job_title, 80))}</b>")
+    parts.append(f"👤 {html.escape(_truncate(client_name, 60))}")
+    if received_at:
+        parts.append(f"🕐 {html.escape(received_at)}")
+    body_preview = _truncate((body_text or "").strip(), 800)
+    if body_preview:
+        parts.append("")
+        parts.append(html.escape(body_preview))
+    return "\n".join(parts)
+
+
+def format_qna_card(
+    *,
+    client_name: str,
+    job_title: str | None,
+    inbound_text: str,
+    inbound_at: str | None,
+    ai_text: str | None,
+    ai_at: str | None,
+    escalate_reason: str | None = None,
+) -> str:
+    """Карточка диалога для digest «Показать сообщения». CHAT.md §7.3.
+
+    3 режима в зависимости от наличия ai_text + escalate_reason:
+        ai_text есть                  → Q+A карточка (клиент + AI-ответ)
+        ai_text=None, escalate_reason → Карточка с пометкой почему AI не ответил
+        ai_text=None, escalate=None   → Просто карточка входящего (AI был выключен,
+                                        даже не пытался ответить)
+    """
+    parts: list[str] = []
+    if job_title:
+        parts.append(f"💼 <b>{html.escape(_truncate(job_title, 80))}</b>")
+    parts.append(f"👤 {html.escape(_truncate(client_name, 60))}")
+    if inbound_at:
+        parts.append(f"🕐 {html.escape(inbound_at)}")
+    parts.append("")
+    parts.append("📥 <i>Клиент:</i>")
+    parts.append(html.escape(_truncate(inbound_text or "", 800)))
+
+    if ai_text:
+        parts.append("")
+        ai_label = f"📤 <i>AI ответил{' (' + html.escape(ai_at) + ')' if ai_at else ''}:</i>"
+        parts.append(ai_label)
+        parts.append(html.escape(_truncate(ai_text, 800)))
+    elif escalate_reason:
+        parts.append("")
+        parts.append(
+            f"⚠️ <i>AI не ответил, причина: {html.escape(_truncate(escalate_reason, 80))}</i>"
+        )
+    # Если ai_text=None и escalate_reason=None — AI просто был выключен,
+    # никаких пометок не нужно (это нормальная карточка входящего сообщения).
+
+    return "\n".join(parts)
+
+
+async def send_inbound_alert(
+    *,
+    client_name: str,
+    job_title: str | None,
+    body_text: str,
+    job_url: str | None,
+    silent: bool,
+) -> None:
+    """Push-уведомление в TG о новом сообщении от клиента (CHAT.md §7.4).
+
+    silent=True (is_paused → ночной режим) — без звука.
+    silent=False (day mode) — громко.
+    """
+    text = format_inbound_card(
+        client_name=client_name,
+        job_title=job_title,
+        body_text=body_text,
+    )
+    primary, overflow = split_for_telegram(text)
+    await _safe_send_html(
+        upwork_job_id=f"chat:{client_name[:32]}",
+        text=primary,
+        reply_markup=_chat_card_kb(job_url),
+        silent=silent,
+    )
+    if overflow:
+        await _safe_send_html(
+            upwork_job_id=f"chat:{client_name[:32]}",
+            text=overflow,
+            reply_markup=None,
+            silent=True,
+        )
+
+
+async def send_qna_card(
+    *,
+    client_name: str,
+    job_title: str | None,
+    job_url: str | None,
+    inbound_text: str,
+    inbound_at: str | None,
+    ai_text: str | None,
+    ai_at: str | None,
+    escalate_reason: str | None = None,
+) -> None:
+    """Карточка диалога для digest в Отчёте (CHAT.md §7.3). Тихая отправка."""
+    text = format_qna_card(
+        client_name=client_name,
+        job_title=job_title,
+        inbound_text=inbound_text,
+        inbound_at=inbound_at,
+        ai_text=ai_text,
+        ai_at=ai_at,
+        escalate_reason=escalate_reason,
+    )
+    primary, overflow = split_for_telegram(text)
+    await _safe_send_html(
+        upwork_job_id=f"chat:{client_name[:32]}",
+        text=primary,
+        reply_markup=_chat_card_kb(job_url),
+        silent=True,
+    )
+    if overflow:
+        await _safe_send_html(
+            upwork_job_id=f"chat:{client_name[:32]}",
+            text=overflow,
+            reply_markup=None,
+            silent=True,
+        )

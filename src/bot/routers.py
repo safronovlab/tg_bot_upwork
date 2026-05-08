@@ -15,6 +15,9 @@ from src.bot.handlers import (
     cleanup as cleanup_h,
 )
 from src.bot.handlers import (
+    email_creds as email_h,
+)
+from src.bot.handlers import (
     favorites as favorites_h,
 )
 from src.bot.handlers import (
@@ -41,7 +44,14 @@ from src.bot.handlers import (
 from src.bot.handlers import (
     thresholds as thresholds_h,
 )
-from src.bot.states import ApiKeyEdit, CleanupConfirm, ModelEdit, PromptEdit, ThresholdEdit
+from src.bot.states import (
+    ApiKeyEdit,
+    CleanupConfirm,
+    EmailCredentialEdit,
+    ModelEdit,
+    PromptEdit,
+    ThresholdEdit,
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -59,7 +69,14 @@ def _register_main_menu(router: Router) -> None:
     # prefix-match — счётчик `Синхронизация (3)` не должен ломать маршрутизацию
     router.message.register(reports_h.handle_sync, F.text.startswith("Синхронизация"))
 
-    # Подменю Отчёт (BOT.md §10) — drain manual-очереди (без Топ-5 — упрощено)
+    # Подменю Отчёт (BOT.md §10 + CHAT.md §7) — drain manual-очереди + chat-сообщений
+    router.message.register(
+        reports_h.handle_report_show_jobs, F.text.startswith("Показать вакансии")
+    )
+    router.message.register(
+        reports_h.handle_report_show_messages, F.text.startswith("Показать сообщения")
+    )
+    # Обратная совместимость: старая кнопка "Выгрузить все" — для тестов и legacy
     router.message.register(reports_h.handle_report_unload_all, F.text.startswith("Выгрузить все"))
     router.message.register(reports_h.handle_report_clear, F.text == "Очистить очередь")
 
@@ -136,11 +153,21 @@ async def _enter_threshold_edit(message: Message, state: FSMContext) -> None:
     await ui.start_threshold_edit(message, state, field)
 
 
+async def _enter_email_edit(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    field = data.get("email_field")
+    if field is None:
+        await message.answer("Сначала выбери email-поле.")
+        return
+    await email_h.start_email_edit(message, state, field)
+
+
 async def _route_edit_btn(message: Message, state: FSMContext) -> None:
     """Кнопка `Изменить` / `Изменить значение` / `Изменить модель` — диспатчер по state.
 
-    Какой FSM запустить определяется по `slot` / `role` / `field` в state.data,
-    которые предыдущий `show_*_card` положил туда. Без context'а — это API-key edit.
+    Какой FSM запустить определяется по `slot` / `role` / `field` / `email_field`
+    в state.data, которые предыдущий `show_*_card` положил туда. Без любого
+    context'а — это API-key edit.
     """
     data = await state.get_data()
     if data.get("slot") is not None:
@@ -149,6 +176,8 @@ async def _route_edit_btn(message: Message, state: FSMContext) -> None:
         await _enter_model_edit(message, state)
     elif data.get("field") is not None:
         await _enter_threshold_edit(message, state)
+    elif data.get("email_field") is not None:
+        await _enter_email_edit(message, state)
     else:
         await ui.start_apikey_edit(message, state)
 
@@ -170,7 +199,7 @@ async def _universal_cancel(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
     breadcrumbs = {
         k: data[k]
-        for k in ("slot", "role", "field", "section")
+        for k in ("slot", "role", "field", "email_field", "section")
         if data.get(k) is not None
     }
     await state.clear()
@@ -189,6 +218,16 @@ async def _save_api_key_wrapper(message: Message, state: FSMContext) -> None:
     await secrets_h.save_api_key(message, state, notifier_mod.bot)
 
 
+async def _save_email_credential_wrapper(message: Message, state: FSMContext) -> None:
+    """Save handler для EmailCredentialEdit — пробрасывает Bot для удаления password-сообщений."""
+    from src import notifier as notifier_mod
+
+    if notifier_mod.bot is None:
+        await message.answer("Bot недоступен.")
+        return
+    await email_h.save_email_credential(message, state, notifier_mod.bot)
+
+
 async def _upload_prompt_wrapper(message: Message, state: FSMContext) -> None:
     """`.txt`-upload в PromptEdit (BOT.md §6.1) — пробрасывает Bot из notifier."""
     from src import notifier as notifier_mod
@@ -200,7 +239,7 @@ async def _upload_prompt_wrapper(message: Message, state: FSMContext) -> None:
 
 def _register_fsm_handlers(router: Router) -> None:
     """`Сохранить` для каждого FSM + universal buffer + cancel + upload."""
-    fsm_states = (PromptEdit, ApiKeyEdit, ModelEdit, ThresholdEdit)
+    fsm_states = (PromptEdit, ApiKeyEdit, ModelEdit, ThresholdEdit, EmailCredentialEdit)
 
     # Cancel первым — иначе buffer его перехватит
     router.message.register(_universal_cancel, StateFilter(*fsm_states), F.text == "Назад")
@@ -211,6 +250,11 @@ def _register_fsm_handlers(router: Router) -> None:
     router.message.register(models_h.save_model, ModelEdit.waiting_name, F.text == "Сохранить")
     router.message.register(
         thresholds_h.save_threshold, ThresholdEdit.waiting_value, F.text == "Сохранить"
+    )
+    router.message.register(
+        _save_email_credential_wrapper,
+        EmailCredentialEdit.waiting_value,
+        F.text == "Сохранить",
     )
 
     # .txt файлы для PromptEdit (BOT.md §6.1)
@@ -270,6 +314,11 @@ def _register_callbacks(router: Router) -> None:
     # Меню Порогов тоже inline (BOT.md §3.4) — диспатч 11 callback'ов
     router.callback_query.register(
         ui.handle_thresholds_inline_callback, F.data.startswith("thr:")
+    )
+
+    # Меню Email подключения inline (CHAT.md §4) — 4 callback'а (imap/smtp × user/password)
+    router.callback_query.register(
+        email_h.handle_email_inline_callback, F.data.startswith("email:")
     )
 
     router.callback_query.register(_handle_logs_callback, F.data.startswith("logs:"))

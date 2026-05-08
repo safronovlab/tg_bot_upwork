@@ -20,10 +20,19 @@ from src import db
 async def main_menu_kb(pool: Any, is_paused: bool) -> ReplyKeyboardMarkup:
     pause_btn = "Запустить" if is_paused else "Остановить"
 
-    n_report = await db.count_queued_by_reason_cached(pool, "manual")
+    n_jobs = await db.count_queued_by_reason_cached(pool, "manual")
     n_sync = await db.count_queued_by_reason_cached(pool, "menu")
+    # Chat-сообщения копятся независимо от is_paused — счётчик всегда актуален
+    n_chat = await db.count_unshown_inbound_messages_cached(pool)
 
-    report_label = f"Отчёт ({n_report})" if n_report else "Отчёт"
+    # Format: Отчёт (3+5) если есть и вакансии, и сообщения. Иначе одно из.
+    if n_jobs and n_chat:
+        report_label = f"Отчёт ({n_jobs}+{n_chat})"
+    elif n_jobs or n_chat:
+        report_label = f"Отчёт ({n_jobs + n_chat})"
+    else:
+        report_label = "Отчёт"
+
     sync_label = f"Синхронизация ({n_sync})" if n_sync else "Синхронизация"
 
     return ReplyKeyboardMarkup(
@@ -107,11 +116,11 @@ def cleanup_confirm_kb() -> ReplyKeyboardMarkup:
 # Подменю настроек (BOT.md §3.1-§3.4)
 # --------------------------------------------------------------------------- #
 def prompts_submenu_kb() -> ReplyKeyboardMarkup:
-    """BOT.md §3.1 — список 3 слотов промтов (night_report удалён)."""
+    """BOT.md §3.1 — 4 слота промтов (с добавлением dialog_night из миграции 001)."""
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="Промпт: Pre-Screen"), KeyboardButton(text="Промпт: Анализ")],
-            [KeyboardButton(text="Промпт: Cover")],
+            [KeyboardButton(text="Промпт: Cover"), KeyboardButton(text="Промпт: AI ответ")],
             [KeyboardButton(text="В настройки")],
         ],
         resize_keyboard=True,
@@ -229,18 +238,22 @@ def preset_confirm_kb() -> ReplyKeyboardMarkup:
 # --------------------------------------------------------------------------- #
 # Подменю Отчёт (BOT.md §10) — три кнопки
 # --------------------------------------------------------------------------- #
-def report_submenu_kb(n: int) -> ReplyKeyboardMarkup:
-    """Подменю Отчёт — выгрузка manual-очереди.
+def report_submenu_kb(n_jobs: int, n_chat: int = 0) -> ReplyKeyboardMarkup:
+    """Подменю Отчёт — два типа очередей: вакансии (manual queue) и chat-сообщения.
 
-    `n` показывается в скобках прямо в названии кнопки `Выгрузить все (N)`.
+    Чтобы пользователь не путался когда чего нет — кнопки скрываются (счётчик 0).
+    Кнопка `Очистить очередь` действует на ВАКАНСИИ; chat-сообщения чистятся
+    при показе через `Показать сообщения` (флаг is_shown_in_report).
     """
-    all_label = f"Выгрузить все ({n})" if n > 0 else "Выгрузить все"
+    jobs_label = f"Показать вакансии ({n_jobs})" if n_jobs > 0 else "Показать вакансии"
+    chat_label = f"Показать сообщения ({n_chat})" if n_chat > 0 else "Показать сообщения"
+    rows: list[list[KeyboardButton]] = []
+    rows.append([KeyboardButton(text=jobs_label)])
+    rows.append([KeyboardButton(text=chat_label)])
+    rows.append([KeyboardButton(text="Очистить очередь")])
+    rows.append([KeyboardButton(text="Назад")])
     return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text=all_label)],
-            [KeyboardButton(text="Очистить очередь")],
-            [KeyboardButton(text="Назад")],
-        ],
+        keyboard=rows,
         resize_keyboard=True,
         is_persistent=True,
     )
@@ -267,8 +280,22 @@ def settings_inline_kb() -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="Фолбэк модели", callback_data="settings:fallback_models")],
             [InlineKeyboardButton(text="Пороги", callback_data="settings:thresholds")],
             [InlineKeyboardButton(text="API ключ OpenRouter", callback_data="settings:apikey")],
+            [InlineKeyboardButton(text="Email подключение", callback_data="settings:email")],
+            [InlineKeyboardButton(text="AI ответ при остановке", callback_data="settings:chat_ai")],
             [InlineKeyboardButton(text="Логи", callback_data="settings:logs")],
             [InlineKeyboardButton(text="Очистить БД", callback_data="settings:cleanup")],
+        ]
+    )
+
+
+def email_inline_kb() -> InlineKeyboardMarkup:
+    """Меню Email подключения — inline-кнопки. См. CHAT.md §4 Configuration."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="IMAP login", callback_data="email:imap_user")],
+            [InlineKeyboardButton(text="IMAP пароль", callback_data="email:imap_password")],
+            [InlineKeyboardButton(text="SMTP login", callback_data="email:smtp_user")],
+            [InlineKeyboardButton(text="SMTP пароль", callback_data="email:smtp_password")],
         ]
     )
 

@@ -10,8 +10,12 @@ aiohttp==3.13.5
     # via
     #   upwork-tg-bot (pyproject.toml)
     #   aiogram
+aioimaplib==2.0.1
+    # via upwork-tg-bot (pyproject.toml)
 aiosignal==1.4.0
     # via aiohttp
+aiosmtplib==5.1.0
+    # via upwork-tg-bot (pyproject.toml)
 annotated-types==0.7.0
     # via pydantic
 asyncpg==0.31.0

@@ -23,3 +23,8 @@ class ThresholdEdit(StatesGroup):
 
 class CleanupConfirm(StatesGroup):
     waiting = State()
+
+
+class EmailCredentialEdit(StatesGroup):
+    """FSM редактирования IMAP/SMTP логина/пароля. См. CHAT.md §4."""
+    waiting_value = State()

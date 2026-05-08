@@ -45,6 +45,14 @@ async def handle_back(message: Message, state: FSMContext) -> None:
 
     data = await state.get_data()
 
+    # Email-card (CHAT.md §4) → email inline-menu (раньше field-card → thresholds)
+    if data.get("email_field"):
+        await state.update_data(email_field=None)
+        from src.bot.handlers.email_creds import show_email_menu
+
+        await show_email_menu(message)
+        return
+
     # Card → parent sub-submenu
     if data.get("field"):
         await state.update_data(field=None)
@@ -67,6 +75,12 @@ async def handle_back(message: Message, state: FSMContext) -> None:
     if data.get("section") == "presets":
         await state.update_data(section=None)
         await ui.show_thresholds_menu(message)
+        return
+
+    # Email submenu → Settings inline (вышли из email-меню)
+    if data.get("section") == "email":
+        await state.update_data(section=None)
+        await ui.show_settings_menu(message)
         return
 
     # Logs / API key / Cleanup card → Settings inline

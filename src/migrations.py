@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from src import log
+from src import config, log
 
 ROOT = Path(__file__).parent.parent
 SCHEMA_PATH = ROOT / "schema.sql"
@@ -29,7 +29,47 @@ DEFAULT_PROMPTS: dict[str, str] = {
         "Напиши кратко (под 800 символов) персональное cover-letter под эту вакансию. "
         "Без воды, по делу, упоминая 1-2 конкретных пункта из описания."
     ),
+    # AI ответ клиенту в режиме остановки (chat/CHAT.md §6 Night dialog).
+    # Главное правило: AI тянет время до пробуждения оператора, НЕ закрывает сделку.
+    "dialog_night": (
+        "Ты — ночной автоответчик в чате Upwork. Я фрилансер, сейчас не у компьютера.\n"
+        "Клиент написал. Твоя задача: ответить от моего лица за 2-3 строки чтобы клиент\n"
+        "увидел engagement и не ушёл к конкуренту до моего возвращения.\n\n"
+        "ТЫ НЕ ЗАКРЫВАЕШЬ СДЕЛКУ. Никогда. Ни в каком виде.\n\n"
+        "Можно: один specific acknowledgment с конкретикой из сообщения клиента + опц.\n"
+        "один Probe-вопрос + обещание подробного ответа когда вернусь.\n\n"
+        "НИКОГДА: цена/$, сроки выполнения работы, Close-формулы, обязательства,\n"
+        "технические решения по существу, multiple questions.\n\n"
+        "Если в сообщении клиента есть: price/proposal/contract/when can you start,\n"
+        "не-английский, длина >300 слов, запрос на созвон — ответь СТРОГО строкой\n"
+        "`__ESCALATE__: <одно слово причины>` без любого другого текста.\n\n"
+        "Тон: messenger-style, 2-3 строки, contractions (gonna, don't), без em-dash,\n"
+        "без AI-словаря (robust/seamless/leverage/utilize/optimize/ensure/foster).\n\n"
+        "Выход: только чистый текст ответа клиенту, без подписей и приветствий.\n"
+        "ЛИБО строка `__ESCALATE__: <reason>`."
+    ),
 }
+
+
+# Bootstrap secrets из env при первом старте (CHAT.md §4 Configuration).
+# Приоритет: secrets таблица (если есть) → env (если задано). После первого
+# ввода через Telegram UI значения живут в БД, env только для bootstrap.
+BOOTSTRAP_SECRETS: dict[str, str] = {}
+
+
+def _collect_bootstrap_secrets() -> dict[str, str]:
+    """Собрать env-secrets которые имеет смысл вставлять (только непустые).
+
+    Вынесено в функцию (а не статический dict на module-level) чтобы тесты
+    могли подменять config.* и получать актуальные значения.
+    """
+    raw = {
+        "imap_password": config.IMAP_PASSWORD,
+        "smtp_password": config.SMTP_PASSWORD,
+        "imap_user": config.IMAP_USER,
+        "smtp_user": config.SMTP_USER,
+    }
+    return {k: v for k, v in raw.items() if v}
 
 
 async def init_schema(pool: Any) -> None:
@@ -91,6 +131,7 @@ async def init_schema(pool: Any) -> None:
             await log.emit("migration_applied", version=version, name=f.stem)
 
     await _bootstrap_prompts(pool)
+    await _bootstrap_secrets(pool)
 
 
 async def _bootstrap_prompts(pool: Any) -> None:
@@ -114,3 +155,32 @@ async def _bootstrap_prompts(pool: Any) -> None:
             inserted_slots.append(slot)
     if inserted_slots:
         await log.emit("prompts_bootstrap_done", slots=inserted_slots)
+
+
+async def _bootstrap_secrets(pool: Any) -> None:
+    """INSERT IMAP/SMTP credentials из env в `secrets` если они там пусты.
+
+    Идемпотентно — `ON CONFLICT DO NOTHING` гарантирует что пользовательские
+    правки через Telegram UI не перезатираются повторным стартом.
+    Вставляются только непустые env-значения (зачем класть пустые placeholder'ы).
+    """
+    secrets = _collect_bootstrap_secrets()
+    if not secrets:
+        return
+    inserted_names: list[str] = []
+    for name, value in secrets.items():
+        result = await pool.fetchval(
+            """
+            INSERT INTO secrets (name, value) VALUES ($1, $2)
+            ON CONFLICT (name) DO NOTHING
+            RETURNING name
+            """,
+            name,
+            value,
+        )
+        if result is not None:
+            inserted_names.append(name)
+    if inserted_names:
+        # Имена включают «password» — в логи не отправляем сами значения,
+        # только список того что вставили.
+        await log.emit("secrets_bootstrap_done", names=inserted_names)

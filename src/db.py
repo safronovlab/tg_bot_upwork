@@ -11,6 +11,8 @@ import msgspec
 from src.models import BotSettings, Job
 
 if TYPE_CHECKING:
+    from datetime import datetime
+
     from asyncpg import Pool
 
 # --------------------------------------------------------------------------- #
@@ -48,6 +50,10 @@ SETTING_FIELDS: frozenset[str] = frozenset(
         "hard_min_budget_fixed",
         "hard_reject_no_hires",
         "hard_max_vacancy_age_h",
+        # Chat (CHAT.md §3 Settings)
+        "chat_ai_night_enabled",
+        "chat_ai_delay_min_seconds",
+        "chat_ai_delay_max_seconds",
     }
 )
 
@@ -336,24 +342,36 @@ async def clear_all_favorites() -> int:
 # bot_settings + кэш (DATABASE.md §2)
 # --------------------------------------------------------------------------- #
 def _row_to_bot_settings(row: dict) -> BotSettings:
-    return BotSettings(
-        is_paused=row["is_paused"],
-        is_paused_menu=row["is_paused_menu"],
-        pre_screen_threshold=row["pre_screen_threshold"],
-        analysis_threshold=row["analysis_threshold"],
-        hard_min_client_spent=float(row["hard_min_client_spent"]),
-        hard_min_client_rating=float(row["hard_min_client_rating"]),
-        hard_min_hires_for_rating=row["hard_min_hires_for_rating"],
-        hard_min_budget_hourly=float(row["hard_min_budget_hourly"]),
-        hard_min_budget_fixed=float(row["hard_min_budget_fixed"]),
-        hard_reject_no_hires=row["hard_reject_no_hires"],
-        hard_max_vacancy_age_h=row["hard_max_vacancy_age_h"],
-        prescreen_model=row["prescreen_model"],
-        analysis_model=row["analysis_model"],
-        prescreen_fallback_model=row["prescreen_fallback_model"],
-        analysis_fallback_model=row["analysis_fallback_model"],
-        loud_notification_threshold=row["loud_notification_threshold"],
-    )
+    """Маппинг row → BotSettings. Chat-поля могут отсутствовать в row если БД
+    ещё не накатила миграцию 001 — используем default'ы из dataclass.
+    """
+    base: dict[str, Any] = {
+        "is_paused": row["is_paused"],
+        "is_paused_menu": row["is_paused_menu"],
+        "pre_screen_threshold": row["pre_screen_threshold"],
+        "analysis_threshold": row["analysis_threshold"],
+        "hard_min_client_spent": float(row["hard_min_client_spent"]),
+        "hard_min_client_rating": float(row["hard_min_client_rating"]),
+        "hard_min_hires_for_rating": row["hard_min_hires_for_rating"],
+        "hard_min_budget_hourly": float(row["hard_min_budget_hourly"]),
+        "hard_min_budget_fixed": float(row["hard_min_budget_fixed"]),
+        "hard_reject_no_hires": row["hard_reject_no_hires"],
+        "hard_max_vacancy_age_h": row["hard_max_vacancy_age_h"],
+        "prescreen_model": row["prescreen_model"],
+        "analysis_model": row["analysis_model"],
+        "prescreen_fallback_model": row["prescreen_fallback_model"],
+        "analysis_fallback_model": row["analysis_fallback_model"],
+        "loud_notification_threshold": row["loud_notification_threshold"],
+    }
+    # Chat-поля (миграция 001) — берём из row если есть, иначе оставляем default
+    for chat_field in (
+        "chat_ai_night_enabled",
+        "chat_ai_delay_min_seconds",
+        "chat_ai_delay_max_seconds",
+    ):
+        if chat_field in row:
+            base[chat_field] = row[chat_field]
+    return BotSettings(**base)
 
 
 async def get_settings_cached() -> BotSettings:
@@ -683,3 +701,242 @@ async def count_favorites_cached(pool: Pool) -> int:
 # --------------------------------------------------------------------------- #
 async def truncate_jobs() -> None:
     await _conn().execute("TRUNCATE TABLE upwork_jobs RESTART IDENTITY")
+
+
+# --------------------------------------------------------------------------- #
+# Chat — IMAP/SMTP credentials через secrets таблицу
+# Приоритет: secrets (БД) → env (config). Match существующего паттерна
+# get_openrouter_key() (CHAT.md §4 Configuration).
+# --------------------------------------------------------------------------- #
+_CHAT_SECRET_NAMES: frozenset[str] = frozenset(
+    {"imap_user", "imap_password", "smtp_user", "smtp_password"}
+)
+
+
+async def get_chat_secret(name: str) -> str:
+    """Возвращает значение IMAP/SMTP secret. БД → env-fallback → пустая строка.
+
+    Кэшируется через тот же _secret_cache что и openrouter_api_key
+    (TTL 60s — config.LLM_CONCURRENCY и т.п. не задействованы).
+    """
+    if name not in _CHAT_SECRET_NAMES:
+        raise ValueError(f"unknown chat secret: {name!r}")
+    now = time.monotonic()
+    cached = _secret_cache.get(name)
+    if cached is not None:
+        cached_pool, value, ts = cached
+        if cached_pool is _pool and (now - ts) < _SECRET_TTL:
+            return value
+    val = await _conn().fetchval("SELECT value FROM secrets WHERE name = $1", name)
+    if not val:
+        from src import config
+
+        env_map = {
+            "imap_user": config.IMAP_USER,
+            "imap_password": config.IMAP_PASSWORD,
+            "smtp_user": config.SMTP_USER,
+            "smtp_password": config.SMTP_PASSWORD,
+        }
+        val = env_map.get(name, "") or ""
+    _secret_cache[name] = (_pool, val, now)
+    return val
+
+
+# --------------------------------------------------------------------------- #
+# Chat — messages CRUD (CHAT.md §3.2)
+# --------------------------------------------------------------------------- #
+async def insert_inbound_message(
+    *,
+    email_thread_key: bytes,
+    client_name: str,
+    body_text: str,
+    upwork_job_id: int | None = None,
+    job_title: str | None = None,
+    job_url: str | None = None,
+    subject: str | None = None,
+    has_attachment: bool = False,
+    email_message_id: str | None = None,
+    email_in_reply_to: str | None = None,
+    raw_email_uid: str | None = None,
+) -> int | None:
+    """Вставить входящее сообщение от клиента.
+
+    Returns id or None при дубле по raw_email_uid (UNIQUE constraint).
+    """
+    return await _conn().fetchval(
+        """
+        INSERT INTO chat_messages (
+            email_thread_key, upwork_job_id, client_name, job_title, job_url,
+            subject, direction, body_text, has_attachment,
+            email_message_id, email_in_reply_to, raw_email_uid
+        ) VALUES (
+            $1, $2, $3, $4, $5, $6, 'in', $7, $8, $9, $10, $11
+        )
+        ON CONFLICT (raw_email_uid)
+            WHERE raw_email_uid IS NOT NULL
+            DO NOTHING
+        RETURNING id
+        """,
+        email_thread_key,
+        upwork_job_id,
+        client_name,
+        job_title,
+        job_url,
+        subject,
+        body_text,
+        has_attachment,
+        email_message_id,
+        email_in_reply_to,
+        raw_email_uid,
+    )
+
+
+async def insert_outbound_message(
+    *,
+    email_thread_key: bytes,
+    client_name: str,
+    body_text: str,
+    ai_generated: bool,
+    ai_model: str | None = None,
+    upwork_job_id: int | None = None,
+    job_title: str | None = None,
+    job_url: str | None = None,
+    subject: str | None = None,
+    email_message_id: str | None = None,
+    email_in_reply_to: str | None = None,
+    sent_at: datetime | None = None,
+) -> int | None:
+    """Вставить исходящее сообщение (мы → клиент через SMTP)."""
+    return await _conn().fetchval(
+        """
+        INSERT INTO chat_messages (
+            email_thread_key, upwork_job_id, client_name, job_title, job_url,
+            subject, direction, body_text, ai_generated, ai_model,
+            email_message_id, email_in_reply_to, sent_at
+        ) VALUES (
+            $1, $2, $3, $4, $5, $6, 'out', $7, $8, $9, $10, $11, $12
+        )
+        RETURNING id
+        """,
+        email_thread_key,
+        upwork_job_id,
+        client_name,
+        job_title,
+        job_url,
+        subject,
+        body_text,
+        ai_generated,
+        ai_model,
+        email_message_id,
+        email_in_reply_to,
+        sent_at,
+    )
+
+
+async def mark_inbound_escalated(message_id: int, reason: str) -> None:
+    """Пометить входящее как escalate (AI промолчал) — для UI Отчёта."""
+    await _conn().execute(
+        "UPDATE chat_messages SET escalate_reason = $2 WHERE id = $1",
+        message_id,
+        reason[:200],
+    )
+
+
+async def count_unshown_inbound_messages_cached(pool: Pool) -> int:
+    """Счётчик «новых сообщений» для main_menu_kb (BOT.md §1).
+
+    Считает входящие direction='in' с is_shown_in_report=false. Не учитывает
+    исходящие AI-ответы — оператор видит их вместе с входящими в карточках.
+    Кэш TTL 10s (как другие counters).
+    """
+    key = "chat_unshown"
+    cached = _count_get(pool, key)
+    if cached is not None:
+        return cached
+    val = await pool.fetchval(
+        """
+        SELECT COUNT(*) FROM chat_messages
+        WHERE direction = 'in' AND is_shown_in_report = false
+        """,
+    )
+    val = int(val or 0)
+    _count_put(pool, key, val)
+    return val
+
+
+async def get_thread_history(
+    email_thread_key: bytes, limit: int = 20
+) -> list[dict]:
+    """Последние N сообщений треда (для подачи в LLM как контекст).
+
+    Сортировка ASC по received_at — старые первые, чтобы LLM видел диалог
+    в естественном порядке.
+    """
+    rows = await _conn().fetch(
+        """
+        SELECT id, received_at, direction, body_text, ai_generated, escalate_reason
+        FROM chat_messages
+        WHERE email_thread_key = $1
+        ORDER BY received_at DESC
+        LIMIT $2
+        """,
+        email_thread_key,
+        limit,
+    )
+    # Реверсим в Python для ASC-порядка (нативный ASC LIMIT берёт ранние, не последние)
+    return [dict(r) for r in reversed(rows)]
+
+
+async def drain_unshown_messages_for_report() -> list[dict]:
+    """Атомарно выгрузить все новые входящие + связанные с ними AI-ответы.
+
+    UPDATE ... SET is_shown_in_report=true RETURNING — в одну транзакцию.
+    Возвращает все сообщения (in + out) тех тредов где есть unshown inbound,
+    отсортированные по received_at ASC (старые первые).
+    """
+    return [
+        dict(r)
+        for r in await _conn().fetch(
+            """
+            WITH affected_threads AS (
+                UPDATE chat_messages
+                SET is_shown_in_report = true
+                WHERE direction = 'in' AND is_shown_in_report = false
+                RETURNING email_thread_key
+            ),
+            distinct_threads AS (
+                SELECT DISTINCT email_thread_key FROM affected_threads
+            )
+            SELECT m.id, m.received_at, m.email_thread_key, m.client_name,
+                   m.job_title, m.job_url, m.subject, m.direction, m.body_text,
+                   m.ai_generated, m.ai_model, m.escalate_reason, m.sent_at
+            FROM chat_messages m
+            JOIN distinct_threads dt USING (email_thread_key)
+            ORDER BY m.received_at ASC
+            """
+        )
+    ]
+
+
+async def has_recent_human_outbound(
+    email_thread_key: bytes, within_seconds: int
+) -> bool:
+    """True если за последние N секунд оператор сам что-то написал в треде.
+
+    Используется AI перед отправкой ночного ответа — если оператор активен,
+    AI отменяет свою задачу (CHAT.md §6 Race conditions).
+    """
+    val = await _conn().fetchval(
+        """
+        SELECT EXISTS (
+            SELECT 1 FROM chat_messages
+            WHERE email_thread_key = $1
+              AND direction = 'out'
+              AND ai_generated = false
+              AND sent_at > now() - ($2::int || ' seconds')::interval
+        )
+        """,
+        email_thread_key,
+        within_seconds,
+    )
+    return bool(val)

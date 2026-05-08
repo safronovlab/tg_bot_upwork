@@ -48,7 +48,12 @@ def _bind(fn: Callable[[Pool], Awaitable[None]], pool: Pool) -> Callable[[], Awa
 
 
 def start_cron(pool: Pool) -> None:
-    """Запускает 6 фоновых циклов (PIPELINE.md §9). Должен вызываться из running loop."""
+    """Запускает 6 фоновых циклов (PIPELINE.md §9) + IMAP IDLE watcher (CHAT.md §5).
+
+    IMAP-watcher — НЕ периодическая задача (period=0); внутри он сам держит
+    long-poll IDLE и переподключается с exponential backoff. Запускается как
+    отдельный create_task без _loop wrapper.
+    """
     schedule: list[tuple[Callable[[Pool], Awaitable[None]], int]] = [
         (recover_stuck_jobs, 600),
         (compact_and_cleanup_jobs, 86400),
@@ -61,6 +66,13 @@ def start_cron(pool: Pool) -> None:
         task = asyncio.create_task(_loop(_bind(fn, pool), period))
         _tasks.add(task)
         task.add_done_callback(_tasks.discard)
+
+    # IMAP IDLE watcher (CHAT.md §5). Сам держит state, не нужен периодический wrapper.
+    from src.chat.inbox import run_imap_watcher
+
+    imap_task = asyncio.create_task(run_imap_watcher())
+    _tasks.add(imap_task)
+    imap_task.add_done_callback(_tasks.discard)
 
 
 # --------------------------------------------------------------------------- #

@@ -171,9 +171,12 @@ class TestUniversalBuffer:
 # Toggle (BOT.md §3.6)
 # --------------------------------------------------------------------------- #
 class TestToggle:
-    async def test_toggle_inverts_and_emits(self, message, stub_db, stub_log):
+    async def test_toggle_inverts_and_emits(self, message, state, stub_db, stub_log):
+        # Generic handler читает поле для toggle из state.data.field
+        state._data["field"] = "hard_reject_no_hires"
+        state.get_data = AsyncMock(return_value=dict(state._data))
         stub_db["get_setting"].return_value = False
-        await ui.handle_no_hires_toggle(message)
+        await ui.handle_no_hires_toggle(message, state)
         # set_setting был вызван с противоположным значением
         stub_db["set_setting"].assert_awaited()
         call = stub_db["set_setting"].call_args
@@ -181,6 +184,23 @@ class TestToggle:
         assert call.args[1] is True  # инверсия False
         events = [c.args[0] for c in stub_log.call_args_list if c.args]
         assert "threshold_updated" in events
+
+    async def test_chat_ai_toggle(self, message, state, stub_db, stub_log):
+        """CHAT.md §6 — toggle chat_ai_night_enabled через тот же generic handler."""
+        state._data["field"] = "chat_ai_night_enabled"
+        state.get_data = AsyncMock(return_value=dict(state._data))
+        stub_db["get_setting"].return_value = True
+        await ui.handle_no_hires_toggle(message, state)
+        call = stub_db["set_setting"].call_args
+        assert call.args[0] == "chat_ai_night_enabled"
+        assert call.args[1] is False  # инверсия True
+
+    async def test_unknown_field_silently_ignored(self, message, state, stub_db):
+        """Generic handler не должен трогать БД если field не whitelisted."""
+        state._data["field"] = "totally_random_field"
+        state.get_data = AsyncMock(return_value=dict(state._data))
+        await ui.handle_no_hires_toggle(message, state)
+        stub_db["set_setting"].assert_not_awaited()
 
 
 # --------------------------------------------------------------------------- #
