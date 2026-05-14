@@ -1,5 +1,9 @@
 # AI Lead Filter Bot
 
+[![CI](https://github.com/safronovlab/tg_bot_upwork/actions/workflows/ci.yml/badge.svg)](https://github.com/safronovlab/tg_bot_upwork/actions/workflows/ci.yml)
+[![Python](https://img.shields.io/badge/python-3.12-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 **Multi-model AI engine for filtering incoming leads with Telegram delivery.**
 
 Single-user Telegram bot that ingests leads from an external scraper, runs a two-pass LLM analysis (cheap filter then deep analysis), and pushes filtered results into Telegram with a full chat-based UI for queue management and runtime configuration. Built for a Canada-based client, runs on a minimal VPS.
