@@ -1,6 +1,5 @@
 # AI Lead Filter Bot
 
-[![CI](https://github.com/safronovlab/tg_bot_upwork/actions/workflows/ci.yml/badge.svg)](https://github.com/safronovlab/tg_bot_upwork/actions/workflows/ci.yml)
 [![Python](https://img.shields.io/badge/python-3.12-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
