@@ -94,7 +94,7 @@ def card_buttons(job: Any) -> InlineKeyboardMarkup:
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="Открыть на Upwork", url=job.upwork_url or "https://www.upwork.com/"
+                    text="Открыть", url=job.upwork_url or "https://www.upwork.com/"
                 ),
                 InlineKeyboardButton(text="Избранное", callback_data=f"save_{job.upwork_job_id}"),
             ]

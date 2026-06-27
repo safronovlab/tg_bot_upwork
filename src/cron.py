@@ -110,15 +110,16 @@ async def recover_stuck_jobs(pool: Pool) -> None:
 
 
 async def compact_and_cleanup_jobs(pool: Pool) -> None:
-    """Стрип/удаление по retention-таблице (PIPELINE.md §8)."""
+    """Retention (PIPELINE.md §8). Политика: «нет истории».
+    - Доставленные НЕ-избранные → удалить через 7 дней (успеваешь добавить в избранное).
+    - Избранное (is_favorite=true) → хранится бессрочно.
+    - failed → 14 дней. Зависшая ночная очередь (analyzed+queued) → 30 дней.
+    """
     await pool.execute(
         """
-        UPDATE upwork_jobs
-        SET job_description = NULL, ai_analysis = NULL,
-            client_reviews = NULL, questions = NULL
+        DELETE FROM upwork_jobs
         WHERE is_sent = true AND is_favorite = false
-          AND created_at < now() - interval '30 days'
-          AND ai_analysis IS NOT NULL;
+          AND created_at < now() - interval '7 days';
         """
     )
     await pool.execute(
@@ -131,15 +132,8 @@ async def compact_and_cleanup_jobs(pool: Pool) -> None:
     await pool.execute(
         """
         DELETE FROM upwork_jobs
-        WHERE is_sent = true AND is_favorite = false
-          AND created_at < now() - interval '90 days';
-        """
-    )
-    await pool.execute(
-        """
-        DELETE FROM upwork_jobs
         WHERE processing_state = 'analyzed'
-          AND queued_reason IS NOT NULL
+          AND queued_reason IS NOT NULL AND is_favorite = false
           AND created_at < now() - interval '30 days';
         """
     )

@@ -1136,7 +1136,7 @@ class TestKeyboardsHelpers:
         job = MagicMock(upwork_url="https://u/x", upwork_job_id="~01a")
         kb = keyboards.card_buttons(job)
         kb_text = str(kb)
-        assert "Открыть на Upwork" in kb_text
+        assert "Открыть" in kb_text
         assert "save_~01a" in kb_text
 
     def test_card_buttons_empty_url(self):

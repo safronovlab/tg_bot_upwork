@@ -54,18 +54,19 @@ class TestFullPath:
 
 
 class TestPreScreenFilterDeletes:
-    async def test_pre_screen_low_rating_deletes(
+    async def test_pre_screen_low_rating_not_written(
         self, job, settings, stub_db, stub_log, monkeypatch
     ):
+        """pre_rating < порога → FILTERED_PRE, в БД НЕ пишем (вакансия базу не касается)."""
         from src import llm
 
         settings.pre_screen_threshold = 5
-        stub_db["upsert_and_get_state"].return_value = (True, "pending")
         monkeypatch.setattr(llm, "pre_screen", AsyncMock(return_value=2), raising=False)
 
         result = await pipeline.process_incoming_job(job, settings)
         assert result == pipeline.PipelineResult.FILTERED_PRE
-        stub_db["delete_job"].assert_awaited_once_with(job.upwork_job_id)
+        stub_db["upsert_and_get_state"].assert_not_awaited()
+        stub_db["delete_job"].assert_not_awaited()
 
 
 class TestAnalysisFilterDeletes:
@@ -92,15 +93,14 @@ class TestHardFilterDeletes:
 
         settings.hard_min_client_spent = 100
         job.client_total_spent = 0
-        stub_db["upsert_and_get_state"].return_value = (True, "pending")
         pre_mock = AsyncMock(return_value=8)
         monkeypatch.setattr(llm, "pre_screen", pre_mock, raising=False)
 
         result = await pipeline.process_incoming_job(job, settings)
         assert result == pipeline.PipelineResult.FILTERED_HARD
-        # Hard filter — БЕЗ LLM-вызова
+        # Hard filter — БЕЗ LLM-вызова и БЕЗ записи в БД (срабатывает первым)
         pre_mock.assert_not_awaited()
-        stub_db["delete_job"].assert_awaited_once_with(job.upwork_job_id)
+        stub_db["upsert_and_get_state"].assert_not_awaited()
 
 
 class TestRecoveryPicksStuck:
@@ -148,10 +148,10 @@ class TestIdempotentWebhook:
 
 
 # --------------------------------------------------------------------------- #
-# Save first then process (PIPELINE.md §7.1.2)
+# Порядок: дешёвая → запись → дорогая (вакансии < порога дешёвой в БД не пишутся)
 # --------------------------------------------------------------------------- #
-class TestSaveFirstThenProcess:
-    async def test_upsert_called_before_llm(self, job, settings, stub_db, stub_log, monkeypatch):
+class TestPreScreenBeforeSave:
+    async def test_save_between_pre_and_analyze(self, job, settings, stub_db, stub_log, monkeypatch):
         from src import llm
 
         order = []
@@ -173,9 +173,9 @@ class TestSaveFirstThenProcess:
         monkeypatch.setattr(llm, "analyze", fake_analyze, raising=False)
 
         await pipeline.process_incoming_job(job, settings)
-        # upsert ДО любого LLM
-        assert order.index("upsert") < order.index("pre_screen")
-        assert order.index("pre_screen") < order.index("analyze")
+        # дешёвая ДО записи, дорогая — ПОСЛЕ записи
+        assert order.index("pre_screen") < order.index("upsert")
+        assert order.index("upsert") < order.index("analyze")
 
 
 # --------------------------------------------------------------------------- #

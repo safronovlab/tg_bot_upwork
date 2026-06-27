@@ -215,54 +215,58 @@ class TestHardFilter:
 # process_incoming_job — все 8 ветвей выхода (PIPELINE.md §4)
 # --------------------------------------------------------------------------- #
 class TestProcessIncomingJob:
-    async def test_skipped_duplicate_terminal_state(self, job, settings, stub_db, stub_log):
+    async def test_skipped_duplicate_terminal_state(
+        self, job, settings, stub_db, stub_log, llm_pre_ok
+    ):
         stub_db["upsert_and_get_state"].return_value = (False, "delivered")
         result = await pipeline.process_incoming_job(job, settings)
         assert result == pipeline.PipelineResult.SKIPPED_DUPLICATE
 
-    async def test_skipped_duplicate_non_terminal_state(self, job, settings, stub_db, stub_log):
-        """Регрессия: параллельная Vollna-batch на тот же upwork_job_id видела
-        current_state=pending и продолжала pipeline → 3 одинаковых уведомления.
-        Теперь любая существующая запись (inserted=False) skip'ается."""
+    async def test_skipped_duplicate_non_terminal_state(
+        self, job, settings, stub_db, stub_log, llm_pre_ok
+    ):
+        """Vollna шлёт ту же вакансию (пересечение фильтров). Любая существующая
+        запись (inserted=False) skip'ается → в TG приходит ОДИН раз."""
         stub_db["upsert_and_get_state"].return_value = (False, "pending")
         result = await pipeline.process_incoming_job(job, settings)
         assert result == pipeline.PipelineResult.SKIPPED_DUPLICATE
 
-    async def test_skipped_duplicate_pre_screened_state(self, job, settings, stub_db, stub_log):
-        """Та же регрессия для уже прошедшего pre_screen — параллельная таска
-        не должна делать второй analysis."""
+    async def test_skipped_duplicate_pre_screened_state(
+        self, job, settings, stub_db, stub_log, llm_pre_ok
+    ):
+        """Дубль уже прошедшего pre_screen — параллельная таска не делает второй analysis."""
         stub_db["upsert_and_get_state"].return_value = (False, "pre_screened")
         result = await pipeline.process_incoming_job(job, settings)
         assert result == pipeline.PipelineResult.SKIPPED_DUPLICATE
 
-    async def test_filtered_hard_deletes(self, job, settings, stub_db, stub_log):
+    async def test_filtered_hard_not_written(self, job, settings, stub_db, stub_log):
+        """Hard-фильтр срабатывает ДО записи — в БД ничего не пишется."""
         settings.hard_min_client_spent = 1_000_000
         job.client_total_spent = 0
-        stub_db["upsert_and_get_state"].return_value = (True, "pending")
         result = await pipeline.process_incoming_job(job, settings)
         assert result == pipeline.PipelineResult.FILTERED_HARD
-        stub_db["delete_job"].assert_awaited_once_with(job.upwork_job_id)
+        stub_db["upsert_and_get_state"].assert_not_awaited()
 
-    async def test_pre_screen_failed_marks_failed(
+    async def test_pre_screen_failed_no_db(
         self, job, settings, stub_db, stub_log, monkeypatch
     ):
+        """Дешёвая упала → LLM_FAILED, в БД ничего не пишем (строки нет)."""
         from src import llm
 
-        stub_db["upsert_and_get_state"].return_value = (True, "pending")
         monkeypatch.setattr(llm, "pre_screen", AsyncMock(return_value=None), raising=False)
         result = await pipeline.process_incoming_job(job, settings)
         assert result == pipeline.PipelineResult.LLM_FAILED
-        stub_db["mark_failed"].assert_awaited()
+        stub_db["upsert_and_get_state"].assert_not_awaited()
 
-    async def test_filtered_pre_deletes(self, job, settings, stub_db, stub_log, monkeypatch):
+    async def test_filtered_pre_not_written(self, job, settings, stub_db, stub_log, monkeypatch):
+        """pre_rating < порога → FILTERED_PRE, в БД НЕ пишем (вакансия базу не касается)."""
         from src import llm
 
         settings.pre_screen_threshold = 5
-        stub_db["upsert_and_get_state"].return_value = (True, "pending")
         monkeypatch.setattr(llm, "pre_screen", AsyncMock(return_value=2), raising=False)
         result = await pipeline.process_incoming_job(job, settings)
         assert result == pipeline.PipelineResult.FILTERED_PRE
-        stub_db["delete_job"].assert_awaited_once_with(job.upwork_job_id)
+        stub_db["upsert_and_get_state"].assert_not_awaited()
 
     async def test_analysis_failed_short(self, job, settings, stub_db, stub_log, monkeypatch):
         from src import llm
@@ -469,10 +473,10 @@ class TestProcessIncomingJob:
         _, kwargs = stub_notifier.send_job.call_args
         assert kwargs.get("silent") is False
 
-    async def test_job_received_emitted_after_upsert(
+    async def test_pre_screen_runs_before_save(
         self, job, settings, stub_db, stub_log, monkeypatch
     ):
-        """job_received должен эмититься ДО любых LLM-вызовов (гарантия §7.1.5)."""
+        """Новый порядок: дешёвая нейронка ДО записи в БД (job_received на save)."""
         from src import llm
 
         stub_db["upsert_and_get_state"].return_value = (True, "pending")
@@ -496,7 +500,7 @@ class TestProcessIncomingJob:
         await pipeline.process_incoming_job(job, settings)
         emit_idx = next(i for i, x in enumerate(order) if x == ("emit", "job_received"))
         pre_idx = order.index("pre_screen")
-        assert emit_idx < pre_idx
+        assert pre_idx < emit_idx  # дешёвая нейронка раньше записи/job_received
 
 
 # --------------------------------------------------------------------------- #

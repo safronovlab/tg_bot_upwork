@@ -94,7 +94,7 @@ def split_for_telegram(text: str) -> tuple[str, str | None]:
 # Билдеры inline-клавиатур (BOT.md §9)
 # --------------------------------------------------------------------------- #
 def _upwork_btn(url: str) -> InlineKeyboardButton:
-    return InlineKeyboardButton(text="Открыть на Upwork", url=url or "https://www.upwork.com/")
+    return InlineKeyboardButton(text="Открыть", url=url or "https://www.upwork.com/")
 
 
 def kb_unfavorited(upwork_job_id: str, url: str) -> InlineKeyboardMarkup:
@@ -233,10 +233,87 @@ async def _delete_overflow(upwork_job_id: str) -> None:
 # --------------------------------------------------------------------------- #
 # Публичные API: отправка карточек
 # --------------------------------------------------------------------------- #
+def _fmt_budget(job: Job) -> str:
+    """Ставка/бюджет из вакансии: '$60-90/час' или '$500'."""
+    if not job.budget:
+        return ""
+    suffix = "/час" if (job.budget_type or "").lower().startswith("hour") else ""
+    return f"{job.budget}{suffix}"
+
+
+def _fmt_client(job: Job) -> str:
+    """Сводка по клиенту: страна · потрачено · наймы · рейтинг (что есть)."""
+    parts: list[str] = []
+    if job.client_country:
+        parts.append(job.client_country)
+    if job.client_total_spent:
+        parts.append(f"${job.client_total_spent:,.0f} потрач.")
+    if job.client_total_hires is not None:
+        parts.append(f"{job.client_total_hires} наймов")
+    if job.client_rating:
+        parts.append(f"{job.client_rating:.2f}★")
+    return " · ".join(parts)
+
+
+# Цвет-маркер по баллу — единственный эмодзи в карточке. Цвета = редкость предметов
+# в World of Warcraft (по возрастанию): Poor(серый) → Common(белый) → Uncommon(зелёный)
+# → Rare(синий) → Epic(фиолетовый) → Legendary(оранжевый). В попапе Telegram сразу
+# видно «редкость» лида по цвету. (Серого кружка в эмодзи нет — Poor показываем ⚫.)
+_RATING_EMOJI: dict[int, str] = {
+    10: "🟠",  # Legendary
+    9: "🟣",   # Epic
+    8: "🔵",   # Rare
+    7: "🟢",   # Uncommon
+    6: "⚪",   # Common
+    5: "⚪",   # Common
+}
+
+
+def _rating_emoji(rating: int) -> str:
+    """Цвет-маркер рейтинга по редкости WoW. ≤4 → ⚫ (Poor / серый)."""
+    return _RATING_EMOJI.get(rating, "⚫")
+
+
+def render_analysis_card(parsed: dict, job: Job) -> str:
+    """Собирает decision-first текст карточки из JSON-полей анализа + фактов вакансии.
+
+    Эмодзи только у рейтинга (см. _rating_emoji); остальные строки — без иконок.
+    Возвращает ПЛЭЙН-текст (без HTML-тегов) — escape делает слой отправки
+    (format_analysis → _safe_send_html). Хранится как ai_analysis, поэтому все
+    места показа (live-карточка/очередь/избранное) работают без изменений.
+    """
+    rating = round(float(parsed.get("rating") or 0))
+    lines = [f"{_rating_emoji(rating)} РЕЙТИНГ {rating}"]
+    if parsed.get("summary"):
+        lines.append(f"📝 {parsed['summary']}")
+    budget = _fmt_budget(job)
+    if budget:
+        lines.append(f"💰 {budget}")
+    if parsed.get("stack_match"):
+        lines.append(f"🧩 {parsed['stack_match']}")
+    client = _fmt_client(job)
+    if client:
+        lines.append(f"👤 {client}")
+    risks = parsed.get("risks") or []
+    if risks:
+        lines.append(f"⚠️ {'; '.join(risks)}")
+    if parsed.get("reason"):
+        lines.append(f"💬 {parsed['reason']}")
+    return "\n\n".join(lines)  # пустая строка между пунктами
+
+
 def _build_state_a_text(title: str, analysis: str) -> str:
-    """State A (initial delivered card): анализ сверху, ЗАГОЛОВОК под ним. HTML-escape."""
-    title_html = html.escape((title or "").upper())
-    return f"{format_analysis(analysis)}\n\n<b>{title_html}</b>"
+    """State A (initial delivered card): РЕЙТИНГ (первая строка карточки) → ЗАГОЛОВОК
+    → остальной разбор. Заголовок вставляется после первой строки analysis (это
+    строка рейтинга у render_analysis_card). HTML-escape обязателен."""
+    title_html = f"💼 <b>{html.escape((title or '').upper())}</b>"
+    # рейтинг — первый блок; делим по пустой строке (пункты разделены \n\n)
+    parts = (analysis or "").split("\n\n", 1)
+    head = format_analysis(parts[0])  # строка рейтинга (цветная шапка)
+    if len(parts) == 1:
+        return f"{head}\n{title_html}"
+    # рейтинг, заголовок, ПУСТАЯ строка, затем пункты (каждый через пустую строку)
+    return f"{head}\n{title_html}\n\n{format_analysis(parts[1])}"
 
 
 async def send_job(job: Job, analysis: str, *, silent: bool) -> None:

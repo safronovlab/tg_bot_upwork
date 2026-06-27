@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import json
 import logging
 import re
 import time
@@ -75,6 +76,74 @@ def parse_pre_rating(text: str) -> int | None:
         return None
     val = int(m.group(0))
     return val if 0 <= val <= 10 else None
+
+
+def _try_parse_json(text: str) -> dict[str, Any] | None:
+    """Извлекает первый {...}-объект из ответа (в т.ч. внутри ```-обёрток) и
+    нормализует поля. None если валидного JSON с полем rating нет."""
+    start = text.find("{")
+    end = text.rfind("}")
+    if start < 0 or end <= start:
+        return None
+    try:
+        data = json.loads(text[start : end + 1])
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(data, dict) or "rating" not in data:
+        return None
+    try:
+        rating = max(0.0, min(10.0, float(data["rating"])))
+    except (TypeError, ValueError):
+        return None
+    verdict = data.get("verdict")
+    if verdict not in ("брать", "скип"):
+        verdict = "брать" if rating >= 7 else "скип"
+    risks_raw = data.get("risks") or []
+    if isinstance(risks_raw, str):
+        risks = [risks_raw]
+    elif isinstance(risks_raw, list):
+        risks = [str(r) for r in risks_raw if r]
+    else:
+        risks = []
+    return {
+        "rating": rating,
+        "summary": str(data.get("summary") or ""),
+        "stack_match": str(data.get("stack_match") or ""),
+        "risks": risks,
+        "verdict": verdict,
+        "reason": str(data.get("reason") or ""),
+        "legacy_text": None,
+    }
+
+
+def parse_analysis(text: str | None) -> dict[str, Any] | None:
+    """Парсит ответ дорогой нейронки.
+
+    Сначала пробует JSON (новый формат). При неудаче — legacy-режим: вытаскивает
+    `РЕЙТИНГ: N` из прозы (на случай, если модель проигнорировала JSON-инструкцию).
+    Возвращает нормализованный dict с ключами rating/summary/stack_match/risks/
+    verdict/reason/legacy_text, либо None если рейтинг извлечь не удалось.
+
+    `legacy_text` != None означает прозаический ответ — его и показываем как есть;
+    при JSON он None, и карточку собирает notifier.render_analysis_card().
+    """
+    if not text:
+        return None
+    parsed = _try_parse_json(text)
+    if parsed is not None:
+        return parsed
+    if RATING_RE.search(text):
+        rating = parse_rating_float(text)
+        return {
+            "rating": rating,
+            "summary": "",
+            "stack_match": "",
+            "risks": [],
+            "verdict": "брать" if rating >= 7 else "скип",
+            "reason": "",
+            "legacy_text": text,
+        }
+    return None
 
 
 def parse_hourly_budget_max(s: str | None) -> float | None:
@@ -219,23 +288,18 @@ async def _emit_finished(job: Job, result: str, **ctx: Any) -> None:
     )
 
 
-async def _stage_save_and_emit_received(job: Job) -> PipelineResult | None:
-    """Save first, then process — упсёрт ДО любого LLM (PIPELINE.md §7.1.2).
+async def _stage_save(job: Job, pre: int) -> PipelineResult | None:
+    """Первая запись в БД — ПОСЛЕ прохода дешёвой (pre_rating >= порога).
 
-    Любая существующая запись (inserted=False) трактуется как dup и пропускается.
-    Раньше skip срабатывал только для terminal-состояний, и параллельные
-    pipeline-таски на один upwork_job_id (когда Vollna шлёт ту же вакансию
-    в нескольких batch'ах подряд) видели current_state ∈ {pending, pre_screened}
-    и продолжали независимо — приводя к N одинаковым уведомлениям в TG
-    с разными LLM-вердиктами. UNIQUE по upwork_job_id защищает БД, но не TG.
-
-    Trade-off: если бот упал между upsert и доставкой — вакансия зависнет в
-    non-terminal state и при следующем приёме того же payload будет skip'нута.
-    Для текущей нагрузки (single-user, редкие крэши) приемлемо.
+    Дедуп: упсёрт по UNIQUE(upwork_job_id). Существующая запись (inserted=False)
+    = дубль (Vollna шлёт ту же вакансию из-за пересечения фильтров) → пропуск,
+    дорогая нейронка повторно НЕ запускается, в TG вторично НЕ уходит. Атомарный
+    INSERT…ON CONFLICT защищает и от одновременных батчей, и от повторной присылки.
     """
     inserted, _ = await db.upsert_and_get_state(job)
     if not inserted:
         return PipelineResult.SKIPPED_DUPLICATE
+    await db.set_pre_rating_and_state(job.upwork_job_id, pre, "pre_screened")
     await log.emit(
         "job_received",
         upwork_job_id=job.upwork_job_id,
@@ -246,43 +310,51 @@ async def _stage_save_and_emit_received(job: Job) -> PipelineResult | None:
 
 
 async def _stage_hard_filter(job: Job, settings: BotSettings) -> PipelineResult | None:
+    """Rule-based отсев ДО записи в БД (ничего ещё не сохранено — удалять нечего)."""
     reason = hard_filter(job, settings)
     if reason is None:
         return None
     await _emit_finished(job, "filtered_hard", reason=reason)
-    await db.delete_job(job.upwork_job_id)
     return PipelineResult.FILTERED_HARD
 
 
-async def _stage_pre_screen(job: Job, settings: BotSettings) -> PipelineResult | None:
+async def _stage_pre_screen(job: Job, settings: BotSettings) -> int | PipelineResult:
+    """Дешёвая нейронка ДО записи в БД. Возвращает pre_rating (int) на проходе,
+    либо терминальный PipelineResult. В БД ничего не пишем: вакансии с
+    pre_rating < порога (и упавшие) базу НЕ касаются вообще."""
     pre = await llm.pre_screen(None, job)
     if pre is None:
-        await db.mark_failed(job.upwork_job_id, "pre_screen_no_response")
+        await _emit_finished(job, "llm_failed", stage="pre_screen")
         return PipelineResult.LLM_FAILED
     if pre < settings.pre_screen_threshold:
         await _emit_finished(job, "filtered_pre", pre_rating=pre)
-        await db.delete_job(job.upwork_job_id)
         return PipelineResult.FILTERED_PRE
-    await db.set_pre_rating_and_state(job.upwork_job_id, pre, "pre_screened")
-    return None
+    return pre
 
 
 async def _stage_analyze(job: Job, settings: BotSettings) -> tuple[str, float] | PipelineResult:
-    """Returns (analysis, rating_float) на успехе или PipelineResult — конечный.
+    """Returns (card_text, rating_float) на успехе или PipelineResult — конечный.
 
-    Возвращаем float (а не int) чтобы dispatch смог точно сравнить
-    с loud_notification_threshold без ошибок округления.
+    Дорогая нейронка возвращает JSON; мы парсим рейтинг (float, чтобы dispatch
+    точно сравнил с порогами без ошибок округления) и собираем текст карточки.
+    `card_text` сохраняется как ai_analysis и идёт в Telegram.
     """
-    analysis = await llm.analyze(None, job)
-    if not analysis or len(analysis) < 50:
+    raw = await llm.analyze(None, job)
+    if not raw:
         await db.bump_attempts(job.upwork_job_id, "analysis_short_or_empty")
         return PipelineResult.LLM_FAILED
-    rating_float = parse_rating_float(analysis)
+    parsed = parse_analysis(raw)
+    if parsed is None:
+        await db.bump_attempts(job.upwork_job_id, "analysis_unparseable")
+        return PipelineResult.LLM_FAILED
+    rating_float = float(parsed["rating"])
+    legacy = parsed.get("legacy_text")
+    card = legacy if legacy is not None else notifier.render_analysis_card(parsed, job)
     if rating_float < settings.analysis_threshold:
         await _emit_finished(job, "filtered_analysis", rating=round(rating_float))
         await db.delete_job(job.upwork_job_id)
         return PipelineResult.FILTERED_ANALYSIS
-    return analysis, rating_float
+    return card, rating_float
 
 
 async def _stage_dispatch(
@@ -334,16 +406,21 @@ async def _stage_dispatch(
 
 
 async def process_incoming_job(job: Job, settings: BotSettings) -> PipelineResult:
-    """Полный цикл обработки одной вакансии. Стадии — 5 helper'ов выше."""
-    early = await _stage_save_and_emit_received(job)
-    if early is not None:
-        return early
+    """Полный цикл обработки одной вакансии.
 
+    Порядок: hard-фильтр → дешёвая нейронка → ЗАПИСЬ+дедуп → дорогая → dispatch.
+    В БД пишем только после прохода дешёвой (pre_rating >= порога): вакансии ниже
+    порога дешёвой базу не касаются вообще. Дорогая удаляет строку, если её
+    рейтинг < analysis_threshold (записанные 5-6 живут кратко и удаляются)."""
     early = await _stage_hard_filter(job, settings)
     if early is not None:
         return early
 
-    early = await _stage_pre_screen(job, settings)
+    pre = await _stage_pre_screen(job, settings)
+    if isinstance(pre, PipelineResult):
+        return pre
+
+    early = await _stage_save(job, pre)
     if early is not None:
         return early
 
