@@ -149,7 +149,10 @@ async def start(bot: Bot, dp: Dispatcher, port: int = 8080) -> web.AppRunner:
     Возвращает AppRunner для cleanup в lifespan.
     """
     del bot, dp  # пока не используются — см. ARCHITECTURE.md §5.2
-    app = web.Application()
+    # Vollna шлёт батчами; крупные пачки превышают дефолт aiohttp (1 МБ) → 413
+    # и лиды теряются. Поднимаем лимит тела запроса до 50 МБ (тело читается целиком
+    # для json — память не проблема, DE с запасом; эндпоинт под bearer + за Caddy).
+    app = web.Application(client_max_size=50 * 1024 * 1024)
     app.router.add_post("/upwork-lead", upwork_lead)
     app.router.add_post("/upwork-lead/vollna", upwork_lead_vollna)
     app.router.add_get("/health", health)
