@@ -70,6 +70,11 @@ SMTP_PORT: int = int(os.environ.get("SMTP_PORT", "587"))
 SMTP_USER: str = os.environ.get("SMTP_USER", "")
 SMTP_PASSWORD: str = os.environ.get("SMTP_PASSWORD", "")
 
+# Тумблер chat-подсистемы (IMAP watcher + SMTP-ответы клиентам). По умолчанию
+# ВКЛ — чтобы не менять поведение. Выключается через env (CHAT_ENABLED=false):
+# тогда IMAP-watcher не стартует вовсе. Включить обратно — флаг в true + рестарт.
+CHAT_ENABLED: bool = os.environ.get("CHAT_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+
 
 @dataclass(slots=True, frozen=True)
 class Settings:

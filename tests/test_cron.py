@@ -43,6 +43,30 @@ class TestStartCron:
         cron.start_cron(pool)
         assert len(scheduled) == 7
 
+    async def test_chat_disabled_skips_watcher(self, pool, monkeypatch):
+        """CHAT_ENABLED=false → IMAP watcher НЕ стартует, остаётся 6 cron-loop'ов."""
+        scheduled: list = []
+        real_create_task = asyncio.create_task
+
+        def capture(coro):
+            scheduled.append(coro)
+            coro.close()
+            return real_create_task(asyncio.sleep(0))
+
+        monkeypatch.setattr(asyncio, "create_task", capture)
+        for fn in [
+            "recover_stuck_jobs",
+            "compact_and_cleanup_jobs",
+            "cleanup_inbox",
+            "cleanup_events",
+            "prompts_history_trim",
+            "alert_error_burst",
+        ]:
+            monkeypatch.setattr(cron, fn, AsyncMock(), raising=False)
+        monkeypatch.setattr(cron.config, "CHAT_ENABLED", False, raising=False)
+        cron.start_cron(pool)
+        assert len(scheduled) == 6
+
 
 class TestLoop:
     async def test_swallows_exceptions(self, monkeypatch):

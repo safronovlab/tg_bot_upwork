@@ -68,11 +68,13 @@ def start_cron(pool: Pool) -> None:
         task.add_done_callback(_tasks.discard)
 
     # IMAP IDLE watcher (CHAT.md §5). Сам держит state, не нужен периодический wrapper.
-    from src.chat.inbox import run_imap_watcher
+    # Стартует только если chat-подсистема включена (config.CHAT_ENABLED).
+    if config.CHAT_ENABLED:
+        from src.chat.inbox import run_imap_watcher
 
-    imap_task = asyncio.create_task(run_imap_watcher())
-    _tasks.add(imap_task)
-    imap_task.add_done_callback(_tasks.discard)
+        imap_task = asyncio.create_task(run_imap_watcher())
+        _tasks.add(imap_task)
+        imap_task.add_done_callback(_tasks.discard)
 
 
 # --------------------------------------------------------------------------- #
